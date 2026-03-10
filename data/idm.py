@@ -263,7 +263,7 @@ def train(
     per_device_train_batch_size: int = 64,
     per_device_eval_batch_size: int = 64,
     learning_rate: float = 1e-4,
-    warmup_ratio: float = 0.02,
+    warmup_steps: float = 50,
     weight_decay: float = 0.01,
     logging_steps: int = 10,
     eval_steps: int = 250,
@@ -294,8 +294,6 @@ def train(
     print(f"Train sequences: {len(train_dataset)} | Eval sequences: {len(eval_dataset)}")
 
     model = IDM(config)
-    # if device == "cuda": # need to do tracing to understand why it crash
-    #     model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     wandb.init(project="miniworld-idm")
@@ -308,7 +306,7 @@ def train(
             per_device_train_batch_size=per_device_train_batch_size,
             per_device_eval_batch_size=per_device_eval_batch_size,
             learning_rate=learning_rate,
-            warmup_ratio=warmup_ratio,
+            warmup_steps=warmup_steps,
             weight_decay=weight_decay,
             logging_steps=logging_steps,
             eval_strategy="steps",
@@ -372,9 +370,9 @@ if __name__ == "__main__":
     )
 
     train(
-        num_train_epochs=30,
-        per_device_train_batch_size=20,
-        per_device_eval_batch_size=20,
+        num_train_epochs=10,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=16,
         learning_rate=1e-4,
         config=config,
     )

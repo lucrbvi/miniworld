@@ -23,6 +23,10 @@ _DEVICE = (
     else "cpu"
 )
 
+if _DEVICE == "cuda":
+    _flash_attn = get_kernel("kernels-community/flash-attn3")
+    _flash_attn_func = _flash_attn.flash_attn_func
+
 class VisionEncoder(nn.Module):
     """A very simple CNN layer to patchify images and generate N patches of D dimensions"""
 
@@ -118,53 +122,28 @@ class MHAttention(nn.Module):
             }
         )
 
-    def forward(self, x: Tensor):
+    def attn(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        B, N, _, _ = q.shape
+        if _DEVICE == "cuda":
+            out, lse = _flash_attn_func(q, k, v, causal=False)
+        else:
+            q_ = q.transpose(1, 2)
+            k_ = k.transpose(1, 2)
+            v_ = v.transpose(1, 2)
+            out = attn(q_, k_, v_, self.h_dim).transpose(1, 2)
+        return out.reshape(B, N, -1)
+
+    def forward(self, x: Tensor) -> Tensor:
         x = pe(x)
         B, N, _ = x.shape
+
         for i, block in enumerate(self.blocks):
             normed = self.norms1[i](x)
             q = block["wq"](normed).view(B, N, self.n_heads, self.h_dim)
             k = block["wk"](normed).view(B, N, self.n_heads, self.h_dim)
             v = block["wv"](normed).view(B, N, self.n_heads, self.h_dim)
 
-            if _DEVICE == "cuda":
-                # Try flash attention with standard (B, N, n_heads, h_dim) format first
-                # If that fails, some kernels expect (B, n_heads, N, h_dim)
-                try:
-                    flash_out = self.flash(q, k, v, softmax_scale=None, causal=False)
-                    out = flash_out[0] if isinstance(flash_out, tuple) else flash_out
-                except RuntimeError as e:
-                    # Try with transposed format (B, n_heads, N, h_dim)
-                    q_t = q.transpose(1, 2)
-                    k_t = k.transpose(1, 2)
-                    v_t = v.transpose(1, 2)
-                    flash_out = self.flash(q_t, k_t, v_t, softmax_scale=None, causal=False)
-                    out = flash_out[0] if isinstance(flash_out, tuple) else flash_out
-                    # Transpose output back if needed
-                    if out.shape[1] == self.n_heads:
-                        out = out.transpose(1, 2)
-
-                # Handle different output formats from different flash attention implementations
-                if out.dim() == 4:
-                    # Standard format: (B, N, n_heads, h_dim) or (B, n_heads, N, h_dim)
-                    if out.shape == (B, N, self.n_heads, self.h_dim):
-                        out = out.view(B, N, -1)
-                    elif out.shape == (B, self.n_heads, N, self.h_dim):
-                        out = out.transpose(1, 2).contiguous().view(B, N, -1)
-                    else:
-                        # Try to reshape based on total size
-                        out = out.contiguous().view(B, N, -1)
-                elif out.dim() == 3:
-                    # Some implementations return (B, N, dim) directly
-                    pass
-                else:
-                    raise ValueError(f"Unexpected flash attention output shape: {out.shape}, expected 3D or 4D tensor")
-            else:
-                q = q.transpose(1, 2)
-                k = k.transpose(1, 2)
-                v = v.transpose(1, 2)
-                out = attn(q, k, v, dim=self.h_dim).transpose(1, 2)
-                out = out.reshape(B, N, -1)
+            out = self.attn(q, k, v)
             x = block["wo"](out) + x
             x = self.ffn[i](self.norms2[i](x)) + x
 

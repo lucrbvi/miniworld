@@ -27,6 +27,8 @@ Dependencies:
 * [pillow](https://python-pillow.github.io/) (to handle images and videos)
 * [pandas](https://pandas.pydata.org/) (to handle various data)
 * [safetensors](https://huggingface.co/docs/safetensors/index) (to store our weights)
+* [transformers](https://huggingface.co/docs/transformers/index) (to easily train our model)
+* [kernels](https://huggingface.co/docs/kernels/index) (to speed up our model)
 
 ## Quick start
 

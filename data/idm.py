@@ -103,7 +103,7 @@ class IDM(PreTrainedModel):
             nn.Linear(dim, config.n_buttons),
         )
 
-    def forward(self, frames: Tensor) -> Tensor:
+    def forward(self, frames: Tensor, labels: Tensor | None = None) -> Tensor:
         B, T, C, H, W = frames.shape
         x = frames.to(torch.float32) / 255.0
         x = self.initial_conv(x.permute(0, 2, 1, 3, 4))

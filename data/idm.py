@@ -363,7 +363,7 @@ if __name__ == "__main__":
         width=320,
         patch_size=16,
         dim=256,
-        n_heads=13,
+        n_heads=16, # n_heads must be a multiple of 8 - if not it crash fast attention 3
         n_blocks=4,
         ffn_mult=3,
         dropout_proba=0.05,

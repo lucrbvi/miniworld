@@ -108,51 +108,35 @@ class MHAttention(nn.Module):
             k = get_kernel("kernels-community/flash-attn3")
             self.flash = k.flash_attn_func
 
-    def _new_head(self):
-        # TODO: check if disabling bias improves the model
+    def _new_block(self):
         return nn.ModuleDict(
             {
-                "wq": nn.Linear(self.dim, self.h_dim),
-                "wk": nn.Linear(self.dim, self.h_dim),
-                "wv": nn.Linear(self.dim, self.h_dim),
-            }
-        )
-
-    def _new_block(self):
-        block = nn.ModuleDict(
-            {
-                "heads": nn.ModuleList([self._new_head() for _ in range(self.n_heads)]),
+                "wq": nn.Linear(self.dim, self.n_heads * self.h_dim),
+                "wk": nn.Linear(self.dim, self.n_heads * self.h_dim),
+                "wv": nn.Linear(self.dim, self.n_heads * self.h_dim),
                 "wo": nn.Linear(self.n_heads * self.h_dim, self.dim, bias=False),
             }
         )
-        return block
 
     def forward(self, x: Tensor):
         x = pe(x)
+        B, N, _ = x.shape
         for i, block in enumerate(self.blocks):
             normed = self.norms1[i](x)
+            q = block["wq"](normed).view(B, N, self.n_heads, self.h_dim)
+            k = block["wk"](normed).view(B, N, self.n_heads, self.h_dim)
+            v = block["wv"](normed).view(B, N, self.n_heads, self.h_dim)
+
             if _DEVICE == "cuda":
-                head_outputs = [
-                    self.flash(
-                        head["wq"](normed), head["wk"](normed), head["wv"](normed),
-                        softmax_scale=None, causal=False
-                    )
-                    for head in block["heads"]
-                ]
+                out = self.flash(q, k, v, softmax_scale=None, causal=False)[0]
             else:
-                head_outputs = [
-                    attn(
-                        q=head["wq"](normed),
-                        k=head["wk"](normed),
-                        v=head["wv"](normed),
-                        dim=self.h_dim,
-                        # TODO: mask the <CLS> token
-                    )
-                    for head in block["heads"]
-                ]
+                q = q.transpose(1, 2)
+                k = k.transpose(1, 2)
+                v = v.transpose(1, 2)
+                out = attn(q, k, v, dim=self.h_dim).transpose(1, 2)
 
-            x = block["wo"](torch.cat(head_outputs, dim=-1)) + x
-
+            out = out.reshape(B, N, -1)
+            x = block["wo"](out) + x
             x = self.ffn[i](self.norms2[i](x)) + x
 
         return x

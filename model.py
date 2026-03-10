@@ -126,15 +126,11 @@ class MHAttention(nn.Module):
         B, N, H, D = q.shape
         if _DEVICE == "cuda":
             out = _flash_attn_func(q, k, v, causal=False, return_attn_probs=False)
-            # Handle case where flash_attn might return a tuple
-            if isinstance(out, tuple):
-                out = out[0]
-                print("flash_attn out called!") # debug
         else:
-            q_ = q.transpose(1, 2)
-            k_ = k.transpose(1, 2)
-            v_ = v.transpose(1, 2)
-            out = attn(q_, k_, v_, self.h_dim).transpose(1, 2)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            out = attn(q, k, v, self.h_dim).transpose(1, 2)
         return out.reshape(B, N, -1)
 
     def forward(self, x: Tensor) -> Tensor:

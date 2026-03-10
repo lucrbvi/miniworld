@@ -263,8 +263,8 @@ def train(
     per_device_train_batch_size: int = 64,
     per_device_eval_batch_size: int = 64,
     learning_rate: float = 1e-4,
-    warmup_steps: float = 50,
-    weight_decay: float = 0.01,
+    warmup_steps: float = 200,
+    weight_decay: float = 0.05,
     logging_steps: int = 10,
     eval_steps: int = 250,
     save_steps: int = 500,
@@ -335,6 +335,7 @@ def train(
     )
 
     trainer.train()
+
     return model
 
 def load_idm(
@@ -372,42 +373,26 @@ if __name__ == "__main__":
         n_heads=16,
         n_blocks=4,
         ffn_mult=3,
-        dropout_proba=0.05,
+        dropout_proba=0.15,
         context_len=60,
         n_buttons=9,
     )
 
     if args.run:
-        # Inference mode: load weights and test on a sample
         m = load_idm(args.weights, config=config)
-
         ds = load_dataset("lucrbrtv/doom-e1-gameplay", split="train")
-        train_dataset, train_actions = preprocess_dataset(
-            ds, config.context_len, cache_dir="./data/cache/idm"
-        )
-
+        train_dataset, _ = preprocess_dataset(ds, config.context_len, cache_dir="./data/cache/idm")
         frames = train_dataset[210].get("frames").unsqueeze(0)
         labels = train_dataset[210].get("labels").unsqueeze(0)
-
         logits = m(frames)
         loss = nn.BCEWithLogitsLoss()(logits[:, :-1], labels[:, :-1])
-
-        # Get predicted actions (apply sigmoid + threshold)
-        probs = torch.sigmoid(logits)
-        predictions = (probs > 0.5).float()
-
         print(f"Loss: {loss.item():.4f}")
-        print(f"Logits shape: {logits.shape}")
-        print(f"\nGround truth actions: {labels[0].detach().cpu().numpy().astype(int)}")
-        print(f"Predicted actions: {predictions[0].detach().cpu().numpy().astype(int)}")
-        print(f"\nProbabilities:\n{probs[0].detach().cpu().numpy().round(3)}")
     else:
-        # Training mode
         train(
             num_train_epochs=30,
-            per_device_train_batch_size=20,
-            per_device_eval_batch_size=20,
-            learning_rate=1e-4,
+            per_device_train_batch_size=26,
+            per_device_eval_batch_size=26,
+            learning_rate=5e-5,
             config=config,
             output_dir="./checkpoints"
         )

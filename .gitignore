@@ -16,3 +16,5 @@ wheels/
 _vizdoom.ini
 
 checkpoints/
+wandb/
+cache/

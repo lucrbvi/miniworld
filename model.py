@@ -13,7 +13,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from kernels import get_kernel
 
+_DEVICE = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "mps"
+    if torch.mps.is_available()
+    else "cpu"
+)
 
 class VisionEncoder(nn.Module):
     """A very simple CNN layer to patchify images and generate N patches of D dimensions"""
@@ -96,6 +104,10 @@ class MHAttention(nn.Module):
             [nn.LayerNorm(self.dim) for _ in range(config["n_blocks"])]
         )
 
+        if _DEVICE == "cuda":
+            k = get_kernel("kernels-community/flash-attn3")
+            self.flash = k.flash_attn_func
+
     def _new_head(self):
         # TODO: check if disabling bias improves the model
         return nn.ModuleDict(
@@ -119,16 +131,26 @@ class MHAttention(nn.Module):
         x = pe(x)
         for i, block in enumerate(self.blocks):
             normed = self.norms1[i](x)
-            head_outputs = [
-                attn(
-                    q=head["wq"](normed),
-                    k=head["wk"](normed),
-                    v=head["wv"](normed),
-                    dim=self.h_dim,
-                    # TODO: mask the <CLS> token
-                )
-                for head in block["heads"]
-            ]
+            if _DEVICE == "cuda":
+                head_outputs = [
+                    self.flash(
+                        head["wq"](normed), head["wk"](normed), head["wv"](normed),
+                        softmax_scale=None, causal=False
+                    )
+                    for head in block["heads"]
+                ]
+            else:
+                head_outputs = [
+                    attn(
+                        q=head["wq"](normed),
+                        k=head["wk"](normed),
+                        v=head["wv"](normed),
+                        dim=self.h_dim,
+                        # TODO: mask the <CLS> token
+                    )
+                    for head in block["heads"]
+                ]
+
             x = block["wo"](torch.cat(head_outputs, dim=-1)) + x
 
             x = self.ffn[i](self.norms2[i](x)) + x

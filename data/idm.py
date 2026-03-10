@@ -231,8 +231,8 @@ class IDMDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         start = self.valid_indices[idx]
         return {
-            "frames": torch.from_numpy(self.frames_mm[start:start + self.context_len].copy()).contiguous().pin_memory(),
-            "labels": torch.from_numpy(self.actions_arr[start:start + self.context_len].copy()).contiguous().pin_memory(),
+            "frames": torch.from_numpy(self.frames_mm[start:start + self.context_len].copy()).contiguous(),
+            "labels": torch.from_numpy(self.actions_arr[start:start + self.context_len].copy()).contiguous(),
         }
 
 class IDMTrainer(Trainer):
@@ -373,8 +373,8 @@ if __name__ == "__main__":
 
     train(
         num_train_epochs=30,
-        per_device_train_batch_size=64,
-        per_device_eval_batch_size=64,
+        per_device_train_batch_size=20,
+        per_device_eval_batch_size=20,
         learning_rate=1e-4,
         config=config,
     )

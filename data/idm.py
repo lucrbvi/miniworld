@@ -349,13 +349,21 @@ def load_idm(
         model = AutoModel.from_pretrained(model_path)
     elif model_path.endswith(".safetensors"):
         model = IDM(config)
-        model.load_state_dict(load_file(model_path, device=device))
+        state_dict = load_file(model_path, device="cpu")
+        model.load_state_dict(state_dict)
     else:
         raise ValueError(f"Unsupported format: {model_path}")
 
-    return model.to(device).eval()
+    return model.to("cpu").eval()
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="IDM Training / Inference")
+    parser.add_argument("--run", action="store_true", help="Load weights and run inference instead of training")
+    parser.add_argument("--weights", type=str, default="checkpoints/model.safetensors", help="Path to weights file for inference")
+    args = parser.parse_args()
+
     config = IDMConfig(
         height=240,
         width=320,
@@ -369,39 +377,36 @@ if __name__ == "__main__":
         n_buttons=9,
     )
 
-    train(
-        num_train_epochs=10,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
-        learning_rate=1e-4,
-        config=config,
-    )
+    if args.run:
+        # Inference mode: load weights and test on a sample
+        m = load_idm(args.weights, config=config)
 
-    """
-    config = IDMConfig(
-        height=240,
-        width=320,
-        patch_size=16,
-        dim=256,
-        n_heads=13,
-        n_blocks=4,
-        ffn_mult=3,
-        dropout_proba=0.1,
-        context_len=50,
-        n_buttons=9,
-    )
+        ds = load_dataset("lucrbrtv/doom-e1-gameplay", split="train")
+        train_dataset, train_actions = preprocess_dataset(
+            ds, config.context_len, cache_dir="./data/cache/idm"
+        )
 
-    m = load_idm("checkpoints/idm.safetensors", config=config)
-    ds = load_dataset("lucrbrtv/doom-e1-gameplay", split="train")
-    train_dataset, train_actions = preprocess_dataset(
-        ds, 50, cache_dir="./data/cache/idm/train"
-    )
+        frames = train_dataset[210].get("frames").unsqueeze(0)
+        labels = train_dataset[210].get("labels").unsqueeze(0)
 
-    frames = train_dataset[0].get("frames").unsqueeze(0)
-    labels = train_dataset[0].get("labels").unsqueeze(0)
+        logits = m(frames)
+        loss = nn.BCEWithLogitsLoss()(logits[:, :-1], labels[:, :-1])
 
-    logits = m(frames)
-    loss = nn.BCEWithLogitsLoss()(logits[:, :-1], labels[:, :-1])
-    print(f"Loss: {loss.item():.4f}")
-    print(f"Logits shape: {logits.shape}")
-    """
+        # Get predicted actions (apply sigmoid + threshold)
+        probs = torch.sigmoid(logits)
+        predictions = (probs > 0.5).float()
+
+        print(f"Loss: {loss.item():.4f}")
+        print(f"Logits shape: {logits.shape}")
+        print(f"\nGround truth actions: {labels[0].detach().cpu().numpy().astype(int)}")
+        print(f"Predicted actions: {predictions[0].detach().cpu().numpy().astype(int)}")
+        print(f"\nProbabilities:\n{probs[0].detach().cpu().numpy().round(3)}")
+    else:
+        # Training mode
+        train(
+            num_train_epochs=10,
+            per_device_train_batch_size=16,
+            per_device_eval_batch_size=16,
+            learning_rate=1e-4,
+            config=config,
+        )

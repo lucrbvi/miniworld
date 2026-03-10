@@ -258,7 +258,7 @@ def compute_metrics(eval_pred) -> dict[str, float]:
     }
 
 def train(
-    output_dir: str = "./data/models/idm",
+    output_dir: str = "./checkpoints",
     num_train_epochs: int = 5,
     per_device_train_batch_size: int = 64,
     per_device_eval_batch_size: int = 64,
@@ -368,12 +368,12 @@ if __name__ == "__main__":
         height=240,
         width=320,
         patch_size=16,
-        dim=256,
-        n_heads=16, # n_heads must be a multiple of 8 - if not it crash fast attention 3
+        dim=384, # head_size must be divisible by 8
+        n_heads=16,
         n_blocks=4,
         ffn_mult=3,
         dropout_proba=0.05,
-        context_len=50,
+        context_len=60,
         n_buttons=9,
     )
 
@@ -404,9 +404,10 @@ if __name__ == "__main__":
     else:
         # Training mode
         train(
-            num_train_epochs=10,
-            per_device_train_batch_size=16,
-            per_device_eval_batch_size=16,
+            num_train_epochs=30,
+            per_device_train_batch_size=20,
+            per_device_eval_batch_size=20,
             learning_rate=1e-4,
             config=config,
+            output_dir="./checkpoints"
         )

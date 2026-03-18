@@ -451,9 +451,9 @@ if __name__ == "__main__":
         print(f"Loss: {loss.item():.4f}")
     else:
         train(
-            num_train_epochs=30,
-            per_device_train_batch_size=40,
-            per_device_eval_batch_size=40,
+            num_train_epochs=60,
+            per_device_train_batch_size=60,
+            per_device_eval_batch_size=60,
             learning_rate=5e-5,
             config=config,
             output_dir="./checkpoints"

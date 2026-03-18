@@ -10,6 +10,7 @@ import wandb
 import numpy as np
 import torch
 import torch.nn as nn
+import random
 
 from torch import Tensor
 from PIL import Image
@@ -230,10 +231,22 @@ class IDMDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         start = self.valid_indices[idx]
-        return {
-            "frames": torch.from_numpy(self.frames_mm[start:start + self.context_len].copy()).contiguous(),
-            "labels": torch.from_numpy(self.actions_arr[start:start + self.context_len].copy()).contiguous(),
-        }
+        frames = torch.from_numpy(self.frames_mm[start:start + self.context_len].copy()).contiguous()
+        labels = torch.from_numpy(self.actions_arr[start:start + self.context_len].copy()).contiguous()
+
+        # Simulate video compression artifacts (JPEG/H.264)
+        if random.random() > 0.5:
+            noise = torch.randn_like(frames.float()) * 2.5
+            frames = (frames.float() + noise).clamp(0, 255).byte()
+
+        # Simulate 30fps by skipping frames (doubling motion magnitude)
+        if random.random() > 0.3:
+            T = frames.size(0)
+            idx_30 = torch.arange(0, T, 2)[:T//2]
+            frames = frames[idx_30].repeat_interleave(2, dim=0)[:T]
+            labels = labels[idx_30].repeat_interleave(2, dim=0)[:T]
+
+        return {"frames": frames, "labels": labels}
 
 class IDMTrainer(Trainer):
     def __init__(self, *args, pos_weight: Tensor | None = None, **kwargs):
@@ -252,10 +265,22 @@ def compute_metrics(eval_pred) -> dict[str, float]:
     # :-1 matches forward() — last frame has no action target
     logits, labels = logits[:, :-1], labels[:, :-1]
     preds = (torch.sigmoid(logits) > 0.5).float()
-    return {
+
+    BUTTONS = ["FWD","BCK","LEFT","RIGHT","TURN_L","TURN_R","ATTACK","USE","SPEED"]
+    metrics = {
         "accuracy": (preds == labels).float().mean().item(),
         "loss": nn.BCEWithLogitsLoss()(logits, labels).item(),
+        "whole_frame_accuracy": (preds == labels).all(dim=-1).float().mean().item(),
     }
+
+    for i, name in enumerate(BUTTONS):
+        tp = (preds[..., i] * labels[..., i]).sum()
+        fp = (preds[..., i] * (1 - labels[..., i])).sum()
+        fn = ((1 - preds[..., i]) * labels[..., i]).sum()
+        f1 = (2 * tp / (2 * tp + fp + fn + 1e-8)).item()
+        metrics[f"f1_{name}"] = f1
+
+    return metrics
 
 def train(
     output_dir: str = "./checkpoints",
@@ -315,8 +340,8 @@ def train(
             save_steps=save_steps,
             logging_dir=f"{output_dir}/logs",
             load_best_model_at_end=True,
-            metric_for_best_model="eval_accuracy",
-            greater_is_better=True,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
             max_grad_norm=max_grad_norm,
             bf16=device == "cuda",
             gradient_accumulation_steps=2,
@@ -327,6 +352,7 @@ def train(
             remove_unused_columns=False,
             report_to=["wandb"],
             push_to_hub=True,
+            hub_model_id="idm"
         ),
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
@@ -357,6 +383,42 @@ def load_idm(
 
     return model.to("cpu").eval()
 
+# need to be called ONE TIME after training and before labelisation
+def calibrate_thresholds(model: IDM, dataset, device: str = _DEVICE, n_buttons: int = 9) -> list[float]:
+    """Calibrate per-button thresholds on validation set for optimal F1."""
+    model.eval()
+    loader = torch.utils.data.DataLoader(dataset, batch_size=64, shuffle=False)
+    all_logits, all_labels = [], []
+
+    with torch.no_grad():
+        for batch in loader:
+            frames = batch["frames"].to(device)
+            labels = batch["labels"]
+            logits = model(frames)[:, :-1]
+            all_logits.append(logits.cpu())
+            all_labels.append(labels[:, :-1])
+
+    logits = torch.cat(all_logits, dim=0)
+    labels = torch.cat(all_labels, dim=0)
+
+    thresholds = []
+    BUTTONS = ["FWD","BCK","LEFT","RIGHT","TURN_L","TURN_R","ATTACK","USE","SPEED"]
+
+    for i in range(n_buttons):
+        best_t, best_f1 = 0.5, 0.0
+        for t in torch.linspace(0.1, 0.9, 80):
+            preds = (torch.sigmoid(logits[..., i]) > t).float()
+            tp = (preds * labels[..., i]).sum()
+            fp = (preds * (1 - labels[..., i])).sum()
+            fn = ((1 - preds) * labels[..., i]).sum()
+            f1 = (2 * tp / (2 * tp + fp + fn + 1e-8)).item()
+            if f1 > best_f1:
+                best_f1, best_t = f1, t.item()
+        thresholds.append(best_t)
+        print(f"{BUTTONS[i]}: threshold={best_t:.3f}, F1={best_f1:.3f}")
+
+    return thresholds
+
 if __name__ == "__main__":
     import argparse
 
@@ -374,7 +436,7 @@ if __name__ == "__main__":
         n_blocks=4,
         ffn_mult=3,
         dropout_proba=0.15,
-        context_len=60,
+        context_len=16,
         n_buttons=9,
     )
 
@@ -390,8 +452,8 @@ if __name__ == "__main__":
     else:
         train(
             num_train_epochs=30,
-            per_device_train_batch_size=26,
-            per_device_eval_batch_size=26,
+            per_device_train_batch_size=28,
+            per_device_eval_batch_size=28,
             learning_rate=5e-5,
             config=config,
             output_dir="./checkpoints"

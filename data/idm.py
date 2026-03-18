@@ -452,8 +452,8 @@ if __name__ == "__main__":
     else:
         train(
             num_train_epochs=30,
-            per_device_train_batch_size=28,
-            per_device_eval_batch_size=28,
+            per_device_train_batch_size=40,
+            per_device_eval_batch_size=40,
             learning_rate=5e-5,
             config=config,
             output_dir="./checkpoints"

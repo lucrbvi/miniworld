@@ -192,4 +192,4 @@ class WorldModel(nn.Module):
 
         cls = x[:, 0, :]
 
-        return self.decoder(cls)
+        return self.decoder(cls) # TODO: the decoder should receive all the patches to generate good frames

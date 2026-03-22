@@ -7,6 +7,7 @@ Dataset: https://huggingface.co/datasets/lucrbrtv/doom-e1-gameplay
 import os
 import sys
 import wandb
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -256,14 +257,13 @@ class IDMTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         logits = model(inputs["frames"])
         loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight.to(logits.device) if self.pos_weight is not None else None)(
-            logits[:, :-1], inputs["labels"][:, :-1]
+            logits[:, :-1], inputs["labels"][:, :-1] # drop last frame
         )
         return (loss, {"logits": logits}) if return_outputs else loss
 
 def compute_metrics(eval_pred) -> dict[str, float]:
     logits, labels = map(torch.from_numpy, eval_pred)
-    # :-1 matches forward() — last frame has no action target
-    logits, labels = logits[:, :-1], labels[:, :-1]
+    logits, labels = logits[:, :-1], labels[:, :-1] # we drop the last frame
     preds = (torch.sigmoid(logits) > 0.5).float()
 
     BUTTONS = ["FWD","BCK","LEFT","RIGHT","TURN_L","TURN_R","ATTACK","USE","SPEED"]
@@ -419,12 +419,96 @@ def calibrate_thresholds(model: IDM, dataset, device: str = _DEVICE, n_buttons: 
 
     return thresholds
 
+def labelize_and_publish(
+    weights_path: str,
+    video_folder: str,
+    config: IDMConfig | None = None,
+    device: str = _DEVICE,
+    repo_id: str = "lucrbrtv/doom-e1-internet",
+    private: bool = False,
+    thresholds: list[float] | None = None,
+):
+    """Labelize videos from folder w/ pre-trained weights, and publish to Hugging Face."""
+
+    config = config or IDMConfig()
+
+    print(f"Loading model from {weights_path}...")
+    model = load_idm(weights_path, config, device).to(device).eval()
+
+    print(f"Labelizing videos from {video_folder}...")
+    video_files = [f for f in os.listdir(video_folder) if f.endswith('.mp4')]
+    if not video_files:
+        raise ValueError(f"No MP4 files found in {video_folder}")
+
+    samples = []
+    th = thresholds if thresholds else [0.5] * config.n_buttons
+
+    for video_file in tqdm(video_files, desc="Processing videos"):
+        video_path = os.path.join(video_folder, video_file)
+
+        # Extract frames
+        cap = cv2.VideoCapture(video_path)
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.resize(frame, (config.width, config.height))
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(np.transpose(frame, (2, 0, 1)))  # HWC -> CHW
+        cap.release()
+
+        if len(frames) < config.context_len:
+            print(f"Skipping {video_file}: only {len(frames)} frames")
+            continue
+
+        # Labelize
+        episode_id = os.path.splitext(video_file)[0]
+        stride = config.context_len
+        n_windows = (len(frames) - config.context_len) // stride + 1
+
+        for start_idx in tqdm(range(0, len(frames) - config.context_len + 1, stride),
+                              desc=f"  {video_file}", total=n_windows, leave=False):
+            window = frames[start_idx:start_idx + config.context_len]
+            batch = torch.from_numpy(np.stack(window)).unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                logits = model(batch)
+                probs = torch.sigmoid(logits)
+
+            for t in range(config.context_len):
+                action = (probs[0, t] > torch.tensor(th).to(device)).float().cpu().numpy()
+                samples.append({
+                    "episode": episode_id,
+                    "frame": frames[start_idx + t],
+                    "action": action.tolist(),
+                })
+
+    print(f"Generated {len(samples)} labeled frames")
+
+    # Publish to Hugging Face
+    if samples:
+        dataset = HFDataset.from_dict({
+            "episode": [s["episode"] for s in samples],
+            "frame": [s["frame"] for s in samples],
+            "action": [s["action"] for s in samples],
+        })
+        print(f"Publishing to {repo_id}...")
+        dataset.push_to_hub(repo_id, private=private)
+        print(f"Published to https://huggingface.co/{repo_id}")
+    else:
+        print("No samples to publish!")
+
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="IDM Training / Inference")
+    parser = argparse.ArgumentParser(description="IDM Training / Inference / Labelization")
     parser.add_argument("--run", action="store_true", help="Load weights and run inference instead of training")
     parser.add_argument("--weights", type=str, default="checkpoints/model.safetensors", help="Path to weights file for inference")
+    parser.add_argument("--labelize", action="store_true", help="Labelize videos in a folder and publish to HF")
+    parser.add_argument("--video-folder", type=str, help="Folder containing MP4 videos to labelize")
+    parser.add_argument("--repo-id", type=str, default="lucrbrtv/doom-e1-internet", help="HuggingFace repo ID for publishing")
+    parser.add_argument("--private", action="store_true", help="Make the published dataset private")
     args = parser.parse_args()
 
     config = IDMConfig(
@@ -440,7 +524,17 @@ if __name__ == "__main__":
         n_buttons=9,
     )
 
-    if args.run:
+    if args.labelize:
+        if not args.video_folder:
+            parser.error("--video-folder is required when using --labelize")
+        labelize_and_publish(
+            weights_path=args.weights,
+            video_folder=args.video_folder,
+            config=config,
+            repo_id=args.repo_id,
+            private=args.private,
+        )
+    elif args.run:
         m = load_idm(args.weights, config=config)
         ds = load_dataset("lucrbrtv/doom-e1-gameplay", split="train")
         train_dataset, _ = preprocess_dataset(ds, config.context_len, cache_dir="./data/cache/idm")

@@ -11,6 +11,7 @@ dependencies = [
     "dotenv>=0.9.9",
     "kernels>=0.12.2",
     "numpy>=2.4.2",
+    "opencv-python>=4.13.0.92",
     "pandas>=3.0.1",
     "pillow>=12.1.1",
     "raylib>=5.5.0.4",

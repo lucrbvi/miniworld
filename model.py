@@ -125,7 +125,17 @@ class MHAttention(nn.Module):
     def attn(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         B, N, H, D = q.shape
         if _DEVICE == "cuda":
+            # Flash Attention requires float16 or bfloat16
+            # Convert to float16 if in float32
+            orig_dtype = q.dtype
+            if orig_dtype == torch.float32:
+                q = q.half()
+                k = k.half()
+                v = v.half()
             out = _flash_attn_func(q, k, v, causal=False, return_attn_probs=False)
+            # Convert back to original dtype if needed
+            if orig_dtype == torch.float32:
+                out = out.float()
         else:
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
@@ -192,4 +202,6 @@ class WorldModel(nn.Module):
 
         cls = x[:, 0, :]
 
-        return self.decoder(cls) # TODO: the decoder should receive all the patches to generate good frames
+        return self.decoder(
+            cls
+        )  # TODO: the decoder should receive all the patches to generate good frames

@@ -127,7 +127,7 @@ def preprocess_frame(frame) -> np.ndarray | None:
     if frame.dtype != np.uint8:
         frame = (frame * 255).clip(0, 255).astype(np.uint8)
     if frame.ndim == 3 and frame.shape[-1] == 3:
-        frame = np.transpose(frame, (2, 0, 1)) # HWC → CHW
+        frame = np.transpose(frame, (2, 0, 1))  # HWC → CHW
     return frame
 
 def preprocess_dataset(
@@ -210,7 +210,10 @@ class IDMDataset(torch.utils.data.Dataset):
         valid_indices: list[int],
         context_len: int,
     ):
-        n_frames, *chw = actions_arr.shape[0], *self._infer_chw(frames_path, actions_arr.shape[0])
+        n_frames, *chw = (
+            actions_arr.shape[0],
+            *self._infer_chw(frames_path, actions_arr.shape[0]),
+        )
         self.frames_mm = np.memmap(
             frames_path,
             dtype=np.uint8,
@@ -234,8 +237,12 @@ class IDMDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         start = self.valid_indices[idx]
-        frames = torch.from_numpy(self.frames_mm[start:start + self.context_len].copy()).contiguous()
-        labels = torch.from_numpy(self.actions_arr[start:start + self.context_len].copy()).contiguous()
+        frames = torch.from_numpy(
+            self.frames_mm[start : start + self.context_len].copy()
+        ).contiguous()
+        labels = torch.from_numpy(
+            self.actions_arr[start : start + self.context_len].copy()
+        ).contiguous()
 
         # Simulate video compression artifacts (JPEG/H.264)
         if random.random() > 0.5:
@@ -245,7 +252,7 @@ class IDMDataset(torch.utils.data.Dataset):
         # Simulate 30fps by skipping frames (doubling motion magnitude)
         if random.random() > 0.3:
             T = frames.size(0)
-            idx_30 = torch.arange(0, T, 2)[:T//2]
+            idx_30 = torch.arange(0, T, 2)[: T // 2]
             frames = frames[idx_30].repeat_interleave(2, dim=0)[:T]
             labels = labels[idx_30].repeat_interleave(2, dim=0)[:T]
 
@@ -258,17 +265,33 @@ class IDMTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         logits = model(inputs["frames"])
-        loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight.to(logits.device) if self.pos_weight is not None else None)(
-            logits[:, :-1], inputs["labels"][:, :-1] # drop last frame
+        loss = nn.BCEWithLogitsLoss(
+            pos_weight=self.pos_weight.to(logits.device)
+            if self.pos_weight is not None
+            else None
+        )(
+            logits[:, :-1],
+            inputs["labels"][:, :-1],  # drop last frame
         )
         return (loss, {"logits": logits}) if return_outputs else loss
 
+
 def compute_metrics(eval_pred) -> dict[str, float]:
     logits, labels = map(torch.from_numpy, eval_pred)
-    logits, labels = logits[:, :-1], labels[:, :-1] # we drop the last frame
+    logits, labels = logits[:, :-1], labels[:, :-1]  # we drop the last frame
     preds = (torch.sigmoid(logits) > 0.5).float()
 
-    BUTTONS = ["FWD","BCK","LEFT","RIGHT","TURN_L","TURN_R","ATTACK","USE","SPEED"]
+    BUTTONS = [
+        "FWD",
+        "BCK",
+        "LEFT",
+        "RIGHT",
+        "TURN_L",
+        "TURN_R",
+        "ATTACK",
+        "USE",
+        "SPEED",
+    ]
     metrics = {
         "accuracy": (preds == labels).float().mean().item(),
         "loss": nn.BCEWithLogitsLoss()(logits, labels).item(),
@@ -318,7 +341,9 @@ def train(
         cache_dir="./data/cache/idm/eval",
     )
 
-    print(f"Train sequences: {len(train_dataset)} | Eval sequences: {len(eval_dataset)}")
+    print(
+        f"Train sequences: {len(train_dataset)} | Eval sequences: {len(eval_dataset)}"
+    )
 
     model = IDM(config)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -354,7 +379,7 @@ def train(
             remove_unused_columns=False,
             report_to=["wandb"],
             push_to_hub=True,
-            hub_model_id="idm"
+            hub_model_id="idm",
         ),
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
@@ -386,7 +411,9 @@ def load_idm(
     return model.to("cpu").eval()
 
 # need to be called ONE TIME after training and before labelisation
-def calibrate_thresholds(model: IDM, dataset, device: str = _DEVICE, n_buttons: int = 9) -> list[float]:
+def calibrate_thresholds(
+    model: IDM, dataset, device: str = _DEVICE, n_buttons: int = 9
+) -> list[float]:
     """Calibrate per-button thresholds on validation set for optimal F1."""
     model.eval()
     loader = torch.utils.data.DataLoader(dataset, batch_size=64, shuffle=False)
@@ -396,7 +423,9 @@ def calibrate_thresholds(model: IDM, dataset, device: str = _DEVICE, n_buttons: 
         for batch in loader:
             frames = batch["frames"].to(device)
             labels = batch["labels"]
-            logits = model(frames)[:, :-1]
+            # Use autocast for Flash Attention compatibility
+            with torch.cuda.amp.autocast(enabled=device == "cuda"):
+                logits = model(frames)[:, :-1]
             all_logits.append(logits.cpu())
             all_labels.append(labels[:, :-1])
 
@@ -404,7 +433,17 @@ def calibrate_thresholds(model: IDM, dataset, device: str = _DEVICE, n_buttons: 
     labels = torch.cat(all_labels, dim=0)
 
     thresholds = []
-    BUTTONS = ["FWD","BCK","LEFT","RIGHT","TURN_L","TURN_R","ATTACK","USE","SPEED"]
+    BUTTONS = [
+        "FWD",
+        "BCK",
+        "LEFT",
+        "RIGHT",
+        "TURN_L",
+        "TURN_R",
+        "ATTACK",
+        "USE",
+        "SPEED",
+    ]
 
     for i in range(n_buttons):
         best_t, best_f1 = 0.5, 0.0
@@ -439,20 +478,24 @@ def labelize_and_publish(
     if not video_files:
         raise ValueError(f"No MP4 in {video_folder}")
 
-    all_samples, th = [], torch.tensor(thresholds or [0.5] * config.n_buttons).to(device)
+    all_samples, th = (
+        [],
+        torch.tensor(thresholds or [0.5] * config.n_buttons).to(device),
+    )
 
     for video_path in tqdm(video_files, desc="Videos"):
-        # Decode
         cap = cv2.VideoCapture(str(video_path))
-        frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame = cv2.resize(frame, (config.width, config.height))
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(np.transpose(frame, (2, 0, 1)))
-        cap.release()
+        try:
+            frames = []
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame = cv2.resize(frame, (config.width, config.height))
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(np.transpose(frame, (2, 0, 1)))
+        finally:
+            cap.release()
 
         if len(frames) < config.context_len:
             continue
@@ -460,16 +503,17 @@ def labelize_and_publish(
         # Create windows
         windows, indices = [], []
         for start in range(0, len(frames) - config.context_len + 1, config.context_len):
-            windows.append(np.stack(frames[start:start + config.context_len]))
+            windows.append(np.stack(frames[start : start + config.context_len]))
             indices.append(start)
 
-        # Batch inference
         actions_list = [None] * len(frames)
         for i in range(0, len(windows), batch_size):
-            batch = torch.from_numpy(np.stack(windows[i:i + batch_size])).to(device)
+            batch = torch.from_numpy(np.stack(windows[i : i + batch_size])).to(device)
             with torch.no_grad():
-                acts = (torch.sigmoid(model(batch)) > th).float()
-            for b, start in enumerate(indices[i:i + batch_size]):
+                with torch.amp.autocast(device_type=_DEVICE):
+                    logits = model(batch)
+                acts = (torch.sigmoid(logits) > th).float()
+            for b, start in enumerate(indices[i : i + batch_size]):
                 for t in range(config.context_len):
                     actions_list[start + t] = acts[b, t].cpu().numpy()
 
@@ -477,25 +521,46 @@ def labelize_and_publish(
         episode = video_path.stem
         for idx, act in enumerate(actions_list):
             if act is not None:
-                all_samples.append({"episode": episode, "frame": frames[idx], "action": act.tolist()})
+                all_samples.append(
+                    {"episode": episode, "frame": frames[idx], "action": act.tolist()}
+                )
 
     # Publish
     if all_samples:
-        HFDataset.from_dict({
-            "episode": [s["episode"] for s in all_samples],
-            "frame": [s["frame"] for s in all_samples],
-            "action": [s["action"] for s in all_samples],
-        }).push_to_hub(repo_id, private=private)
+        HFDataset.from_dict(
+            {
+                "episode": [s["episode"] for s in all_samples],
+                "frame": [s["frame"] for s in all_samples],
+                "action": [s["action"] for s in all_samples],
+            }
+        ).push_to_hub(repo_id, private=private)
         print(f"Published {len(all_samples)} frames to {repo_id}")
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="IDM Training / Inference / Labelization")
-    parser.add_argument("--run", action="store_true", help="Load weights and run inference instead of training")
-    parser.add_argument("--weights", type=str, default="checkpoints/model.safetensors", help="Path to weights file for inference")
-    parser.add_argument("--labelize", action="store_true", help="Labelize videos in a folder and publish to HF")
-    parser.add_argument("--video-folder", type=str, help="Folder containing MP4 videos to labelize")
+    parser = argparse.ArgumentParser(
+        description="IDM Training / Inference / Labelization"
+    )
+    parser.add_argument(
+        "--run",
+        action="store_true",
+        help="Load weights and run inference instead of training",
+    )
+    parser.add_argument(
+        "--weights",
+        type=str,
+        default="checkpoints/model.safetensors",
+        help="Path to weights file for inference",
+    )
+    parser.add_argument(
+        "--labelize",
+        action="store_true",
+        help="Labelize videos in a folder and publish to HF",
+    )
+    parser.add_argument(
+        "--video-folder", type=str, help="Folder containing MP4 videos to labelize"
+    )
     args = parser.parse_args()
 
     config = IDMConfig(
@@ -522,7 +587,9 @@ if __name__ == "__main__":
     elif args.run:
         m = load_idm(args.weights, config=config)
         ds = load_dataset("lucrbrtv/doom-e1-gameplay", split="train")
-        train_dataset, _ = preprocess_dataset(ds, config.context_len, cache_dir="./data/cache/idm")
+        train_dataset, _ = preprocess_dataset(
+            ds, config.context_len, cache_dir="./data/cache/idm"
+        )
         frames = train_dataset[210].get("frames").unsqueeze(0)
         labels = train_dataset[210].get("labels").unsqueeze(0)
         logits = m(frames)
@@ -535,5 +602,5 @@ if __name__ == "__main__":
             per_device_eval_batch_size=60,
             learning_rate=5e-5,
             config=config,
-            output_dir="./checkpoints"
+            output_dir="./checkpoints",
         )

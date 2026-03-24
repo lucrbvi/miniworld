@@ -24,6 +24,7 @@ from transformers import (
     PreTrainedModel,
     PretrainedConfig,
 )
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from model import MHAttention
@@ -35,6 +36,7 @@ _DEVICE = (
     if torch.mps.is_available()
     else "cpu"
 )
+print(_DEVICE)
 
 class IDMConfig(PretrainedConfig):
     model_type = "idm"
@@ -423,31 +425,25 @@ def labelize_and_publish(
     weights_path: str,
     video_folder: str,
     config: IDMConfig | None = None,
-    device: str = _DEVICE,
     repo_id: str = "lucrbrtv/doom-e1-internet",
     private: bool = False,
     thresholds: list[float] | None = None,
+    batch_size: int = 64,
 ):
-    """Labelize videos from folder w/ pre-trained weights, and publish to Hugging Face."""
-
+    """Labelize videos and publish to HF"""
     config = config or IDMConfig()
+    device = _DEVICE
 
-    print(f"Loading model from {weights_path}...")
-    model = load_idm(weights_path, config, device).to(device).eval()
-
-    print(f"Labelizing videos from {video_folder}...")
-    video_files = [f for f in os.listdir(video_folder) if f.endswith('.mp4')]
+    model = load_idm(weights_path, config, str(device)).to(device).eval()
+    video_files = list(Path(video_folder).glob("*.mp4"))
     if not video_files:
-        raise ValueError(f"No MP4 files found in {video_folder}")
+        raise ValueError(f"No MP4 in {video_folder}")
 
-    samples = []
-    th = thresholds if thresholds else [0.5] * config.n_buttons
+    all_samples, th = [], torch.tensor(thresholds or [0.5] * config.n_buttons).to(device)
 
-    for video_file in tqdm(video_files, desc="Processing videos"):
-        video_path = os.path.join(video_folder, video_file)
-
-        # Extract frames
-        cap = cv2.VideoCapture(video_path)
+    for video_path in tqdm(video_files, desc="Videos"):
+        # Decode
+        cap = cv2.VideoCapture(str(video_path))
         frames = []
         while True:
             ret, frame = cap.read()
@@ -455,49 +451,42 @@ def labelize_and_publish(
                 break
             frame = cv2.resize(frame, (config.width, config.height))
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(np.transpose(frame, (2, 0, 1)))  # HWC -> CHW
+            frames.append(np.transpose(frame, (2, 0, 1)))
         cap.release()
 
         if len(frames) < config.context_len:
-            print(f"Skipping {video_file}: only {len(frames)} frames")
             continue
 
-        # Labelize
-        episode_id = os.path.splitext(video_file)[0]
-        stride = config.context_len
-        n_windows = (len(frames) - config.context_len) // stride + 1
+        # Create windows
+        windows, indices = [], []
+        for start in range(0, len(frames) - config.context_len + 1, config.context_len):
+            windows.append(np.stack(frames[start:start + config.context_len]))
+            indices.append(start)
 
-        for start_idx in tqdm(range(0, len(frames) - config.context_len + 1, stride),
-                              desc=f"  {video_file}", total=n_windows, leave=False):
-            window = frames[start_idx:start_idx + config.context_len]
-            batch = torch.from_numpy(np.stack(window)).unsqueeze(0).to(device)
-
+        # Batch inference
+        actions_list = [None] * len(frames)
+        for i in range(0, len(windows), batch_size):
+            batch = torch.from_numpy(np.stack(windows[i:i + batch_size])).to(device)
             with torch.no_grad():
-                logits = model(batch)
-                probs = torch.sigmoid(logits)
+                acts = (torch.sigmoid(model(batch)) > th).float()
+            for b, start in enumerate(indices[i:i + batch_size]):
+                for t in range(config.context_len):
+                    actions_list[start + t] = acts[b, t].cpu().numpy()
 
-            for t in range(config.context_len):
-                action = (probs[0, t] > torch.tensor(th).to(device)).float().cpu().numpy()
-                samples.append({
-                    "episode": episode_id,
-                    "frame": frames[start_idx + t],
-                    "action": action.tolist(),
-                })
+        # Build samples
+        episode = video_path.stem
+        for idx, act in enumerate(actions_list):
+            if act is not None:
+                all_samples.append({"episode": episode, "frame": frames[idx], "action": act.tolist()})
 
-    print(f"Generated {len(samples)} labeled frames")
-
-    # Publish to Hugging Face
-    if samples:
-        dataset = HFDataset.from_dict({
-            "episode": [s["episode"] for s in samples],
-            "frame": [s["frame"] for s in samples],
-            "action": [s["action"] for s in samples],
-        })
-        print(f"Publishing to {repo_id}...")
-        dataset.push_to_hub(repo_id, private=private)
-        print(f"Published to https://huggingface.co/{repo_id}")
-    else:
-        print("No samples to publish!")
+    # Publish
+    if all_samples:
+        HFDataset.from_dict({
+            "episode": [s["episode"] for s in all_samples],
+            "frame": [s["frame"] for s in all_samples],
+            "action": [s["action"] for s in all_samples],
+        }).push_to_hub(repo_id, private=private)
+        print(f"Published {len(all_samples)} frames to {repo_id}")
 
 if __name__ == "__main__":
     import argparse
@@ -507,8 +496,6 @@ if __name__ == "__main__":
     parser.add_argument("--weights", type=str, default="checkpoints/model.safetensors", help="Path to weights file for inference")
     parser.add_argument("--labelize", action="store_true", help="Labelize videos in a folder and publish to HF")
     parser.add_argument("--video-folder", type=str, help="Folder containing MP4 videos to labelize")
-    parser.add_argument("--repo-id", type=str, default="lucrbrtv/doom-e1-internet", help="HuggingFace repo ID for publishing")
-    parser.add_argument("--private", action="store_true", help="Make the published dataset private")
     args = parser.parse_args()
 
     config = IDMConfig(
@@ -531,8 +518,6 @@ if __name__ == "__main__":
             weights_path=args.weights,
             video_folder=args.video_folder,
             config=config,
-            repo_id=args.repo_id,
-            private=args.private,
         )
     elif args.run:
         m = load_idm(args.weights, config=config)

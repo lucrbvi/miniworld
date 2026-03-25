@@ -429,7 +429,7 @@ def labelize_and_publish(
     repo_id: str = "lucrbrtv/doom-e1-internet",
     private: bool = False,
     thresholds: list[float] | None = None,
-    batch_size: int = 64,
+    batch_size: int = 128,
     cache_dir: str = "./data/cache/labelize",
 ):
     """Labelize videos and publish to HF.
@@ -528,7 +528,7 @@ def labelize_and_publish(
                     j += 1
             del frames
 
-    dataset = HFDataset.from_generator(sample_generator)
+    dataset = HFDataset.from_generator(sample_generator, num_proc=16)
     dataset.push_to_hub(repo_id, private=private)
     print(f"Published {len(dataset)} frames to {repo_id}")
 

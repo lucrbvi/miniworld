@@ -6,6 +6,19 @@ Dataset: https://huggingface.co/datasets/lucrbrtv/doom-e1-gameplay
 
 import os
 import sys
+import gc
+import multiprocessing
+
+# Prevent semaphore leaks by forcing fork start method early
+# Must be set before any other imports that use multiprocessing
+try:
+    multiprocessing.set_start_method("fork", force=True)
+except RuntimeError:
+    pass  # Already set
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
+
 import wandb
 import cv2
 import numpy as np
@@ -275,7 +288,6 @@ class IDMTrainer(Trainer):
         )
         return (loss, {"logits": logits}) if return_outputs else loss
 
-
 def compute_metrics(eval_pred) -> dict[str, float]:
     logits, labels = map(torch.from_numpy, eval_pred)
     logits, labels = logits[:, :-1], labels[:, :-1]  # we drop the last frame
@@ -410,56 +422,6 @@ def load_idm(
 
     return model.to("cpu").eval()
 
-# need to be called ONE TIME after training and before labelisation
-def calibrate_thresholds(
-    model: IDM, dataset, device: str = _DEVICE, n_buttons: int = 9
-) -> list[float]:
-    """Calibrate per-button thresholds on validation set for optimal F1."""
-    model.eval()
-    loader = torch.utils.data.DataLoader(dataset, batch_size=64, shuffle=False)
-    all_logits, all_labels = [], []
-
-    with torch.no_grad():
-        for batch in loader:
-            frames = batch["frames"].to(device)
-            labels = batch["labels"]
-            # Use autocast for Flash Attention compatibility
-            with torch.cuda.amp.autocast(enabled=device == "cuda"):
-                logits = model(frames)[:, :-1]
-            all_logits.append(logits.cpu())
-            all_labels.append(labels[:, :-1])
-
-    logits = torch.cat(all_logits, dim=0)
-    labels = torch.cat(all_labels, dim=0)
-
-    thresholds = []
-    BUTTONS = [
-        "FWD",
-        "BCK",
-        "LEFT",
-        "RIGHT",
-        "TURN_L",
-        "TURN_R",
-        "ATTACK",
-        "USE",
-        "SPEED",
-    ]
-
-    for i in range(n_buttons):
-        best_t, best_f1 = 0.5, 0.0
-        for t in torch.linspace(0.1, 0.9, 80):
-            preds = (torch.sigmoid(logits[..., i]) > t).float()
-            tp = (preds * labels[..., i]).sum()
-            fp = (preds * (1 - labels[..., i])).sum()
-            fn = ((1 - preds) * labels[..., i]).sum()
-            f1 = (2 * tp / (2 * tp + fp + fn + 1e-8)).item()
-            if f1 > best_f1:
-                best_f1, best_t = f1, t.item()
-        thresholds.append(best_t)
-        print(f"{BUTTONS[i]}: threshold={best_t:.3f}, F1={best_f1:.3f}")
-
-    return thresholds
-
 def labelize_and_publish(
     weights_path: str,
     video_folder: str,
@@ -468,73 +430,107 @@ def labelize_and_publish(
     private: bool = False,
     thresholds: list[float] | None = None,
     batch_size: int = 64,
+    cache_dir: str = "./data/cache/labelize",
 ):
-    """Labelize videos and publish to HF"""
-    config = config or IDMConfig()
-    device = _DEVICE
+    """Labelize videos and publish to HF.
 
-    model = load_idm(weights_path, config, str(device)).to(device).eval()
+      1. Inference: one video at a time, save ctions to disk.
+      2. Push: generator re-reads videos + loads actions and push to HF Hub
+
+    It avoid us to store every frames in RAM
+    """
+    config = config or IDMConfig()
+    model = load_idm(weights_path, config).to(_DEVICE).eval()
+
     video_files = list(Path(video_folder).glob("*.mp4"))
     if not video_files:
-        raise ValueError(f"No MP4 in {video_folder}")
+        raise ValueError(f"No MP4 files found in {video_folder}")
 
-    all_samples, th = (
-        [],
-        torch.tensor(thresholds or [0.5] * config.n_buttons).to(device),
-    )
+    th = torch.tensor(thresholds or [0.5] * config.n_buttons, device=_DEVICE)
+    os.makedirs(cache_dir, exist_ok=True)
 
-    for video_path in tqdm(video_files, desc="Videos"):
-        cap = cv2.VideoCapture(str(video_path))
-        try:
-            frames = []
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                frame = cv2.resize(frame, (config.width, config.height))
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(np.transpose(frame, (2, 0, 1)))
-        finally:
-            cap.release()
+    def read_video(path: Path) -> list[np.ndarray]:
+        cap = cv2.VideoCapture(str(path))
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.resize(frame, (config.width, config.height))
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(np.transpose(frame, (2, 0, 1)))
+        cap.release()
+        return frames
 
-        if len(frames) < config.context_len:
+    def window_starts(n: int) -> list[int]:
+        return list(range(0, n - config.context_len + 1, config.context_len))
+
+    # Phase 1: inference
+    video_meta = []  # (video_path, actions_path, n_frames)
+
+    for video_path in tqdm(video_files, desc="Labelizing"):
+        frames = read_video(video_path)
+        n = len(frames)
+        if n < config.context_len:
+            print(f"Skipping {video_path.name}: too short ({n} frames)")
             continue
 
-        # Create windows
-        windows, indices = [], []
-        for start in range(0, len(frames) - config.context_len + 1, config.context_len):
-            windows.append(np.stack(frames[start : start + config.context_len]))
-            indices.append(start)
+        frames_arr = np.stack(frames)
+        del frames
 
-        actions_list = [None] * len(frames)
-        for i in range(0, len(windows), batch_size):
-            batch = torch.from_numpy(np.stack(windows[i : i + batch_size])).to(device)
-            with torch.no_grad():
-                with torch.amp.autocast(device_type=_DEVICE):
-                    logits = model(batch)
-                acts = (torch.sigmoid(logits) > th).float()
-            for b, start in enumerate(indices[i : i + batch_size]):
-                for t in range(config.context_len):
-                    actions_list[start + t] = acts[b, t].cpu().numpy()
+        starts = window_starts(n)
+        actions_buf = np.zeros((n, config.n_buttons), dtype=np.float32)
 
-        # Build samples
-        episode = video_path.stem
-        for idx, act in enumerate(actions_list):
-            if act is not None:
-                all_samples.append(
-                    {"episode": episode, "frame": frames[idx], "action": act.tolist()}
-                )
+        for i in range(0, len(starts), batch_size):
+            batch_starts = starts[i : i + batch_size]
+            batch = torch.from_numpy(
+                np.stack([frames_arr[s : s + config.context_len] for s in batch_starts])
+            ).to(_DEVICE)
+            with torch.no_grad(), torch.amp.autocast(device_type=_DEVICE):
+                acts = (torch.sigmoid(model(batch)) > th).float().cpu().numpy()
+            for b, s in enumerate(batch_starts):
+                actions_buf[s : s + config.context_len] = acts[b]
 
-    # Publish
-    if all_samples:
-        HFDataset.from_dict(
-            {
-                "episode": [s["episode"] for s in all_samples],
-                "frame": [s["frame"] for s in all_samples],
-                "action": [s["action"] for s in all_samples],
-            }
-        ).push_to_hub(repo_id, private=private)
-        print(f"Published {len(all_samples)} frames to {repo_id}")
+        # Keep only frames covered by a window
+        covered = np.zeros(n, dtype=bool)
+        for s in starts:
+            covered[s : s + config.context_len] = True
+
+        actions_path = os.path.join(cache_dir, f"{video_path.stem}_actions.npy")
+        np.save(actions_path, actions_buf[covered])
+        video_meta.append((video_path, actions_path, n))
+        print(f"{video_path.name}: {covered.sum()} frames labeled")
+
+        del frames_arr, actions_buf, covered
+        if _DEVICE == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    if not video_meta:
+        raise RuntimeError("No frames were labeled.")
+
+    total = sum(np.load(a, mmap_mode="r").shape[0] for _, a, _ in video_meta)
+    print(f"Building dataset ({total} frames) — re-reading videos for Arrow conversion…")
+
+    # Phase 2: push
+    def sample_generator():
+        for video_path, actions_path, n in video_meta:
+            frames = read_video(video_path)
+            actions = np.load(actions_path)
+            episode = video_path.stem
+            covered = np.zeros(n, dtype=bool)
+            for s in window_starts(n):
+                covered[s : s + config.context_len] = True
+            j = 0
+            for frame, is_covered in zip(frames, covered):
+                if is_covered:
+                    yield {"episode": episode, "frame": frame, "action": actions[j].tolist()}
+                    j += 1
+            del frames
+
+    dataset = HFDataset.from_generator(sample_generator)
+    dataset.push_to_hub(repo_id, private=private)
+    print(f"Published {len(dataset)} frames to {repo_id}")
 
 if __name__ == "__main__":
     import argparse

@@ -30,13 +30,20 @@ from torch import Tensor
 from PIL import Image
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
-from datasets import load_dataset, Dataset as HFDataset,Features, Sequence, Value, Image as HFImage
+from datasets import (
+    load_dataset,
+    Dataset as HFDataset,
+    Features,
+    Sequence,
+    Value,
+    Image as HFImage,
+)
 from transformers import (
     Trainer,
     TrainingArguments,
     PreTrainedModel,
     PretrainedConfig,
-    AutoModel
+    AutoModel,
 )
 from huggingface_hub import HfApi
 from pathlib import Path
@@ -426,150 +433,143 @@ def load_idm(
 def labelize_and_publish(
     weights_path: str,
     video_folder: str,
-    config: IDMConfig | None = None,
     repo_id: str = "lucrbrtv/doom-e1-internet",
-    private: bool = False,
-    thresholds: list[float] | None = None,
+    config: IDMConfig | None = None,
     batch_size: int = 64,
-    cache_dir: str = "./data/cache/labelize",
+    parquet_dir: str = "./data/cache/labelize/parquet",
+    private: bool = False,
 ):
     """
     Labelize gameplay videos with a pre-trained IDM and push to huggingface
     """
-    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")  # requires at least 64 GB of RAM
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1") # requires at least 64 GB of RAM
 
     config = config or IDMConfig()
     model = load_idm(weights_path, config).to(_DEVICE).eval()
+    th = torch.tensor([0.5] * config.n_buttons, device=_DEVICE)
+    use_autocast = _DEVICE == "cuda"
 
-    video_files = list(Path(video_folder).glob("*.mp4"))
+    video_files = sorted(Path(video_folder).glob("*.mp4"))
     if not video_files:
-        raise ValueError(f"No MP4 files found in {video_folder}")
+        raise ValueError(f"No MP4 files in {video_folder}")
 
-    th = torch.tensor(thresholds or [0.5] * config.n_buttons, device=_DEVICE)
+    features = Features({
+        "video_id": Value("int32"),
+        "frame":    HFImage(),
+        "action":   Sequence(Value("int8"), length=config.n_buttons),
+    })
 
-    upload_dir = Path(cache_dir) / "upload"
-    videos_dir = upload_dir / "videos"
-    data_dir = upload_dir / "data"
-    videos_dir.mkdir(parents=True, exist_ok=True)
-    data_dir.mkdir(parents=True, exist_ok=True)
+    Path(parquet_dir).mkdir(parents=True, exist_ok=True)
 
-    def read_video(path: Path) -> list[np.ndarray]:
-        cap = cv2.VideoCapture(str(path))
-        frames = []
+    def infer_actions(frames_arr: np.ndarray) -> np.ndarray:
+        """frames_arr: (N, C, H, W) uint8 → actions (N, n_buttons) int"""
+        n = len(frames_arr)
+        actions = np.zeros((n, config.n_buttons), dtype=np.int32)
+        starts = list(range(0, n - config.context_len + 1, config.context_len))
+
+        for i in range(0, len(starts), batch_size):
+            batch_starts = starts[i : i + batch_size]
+            batch = torch.from_numpy(
+                np.stack([
+                    frames_arr[s : s + config.context_len]
+                    for s in batch_starts
+                ])
+            ).to(_DEVICE)
+
+            with torch.no_grad():
+                ctx = (
+                    torch.amp.autocast(device_type="cuda")
+                    if use_autocast
+                    else contextlib.nullcontext()
+                )
+                with ctx:
+                    logits = model(batch) # (B, T, n_buttons)
+
+            preds = (torch.sigmoid(logits) > th).int().cpu().numpy()
+            for b, s in enumerate(batch_starts):
+                actions[s : s + config.context_len] = preds[b]
+
+        return actions
+
+    def process_video(video_id: int, video_path: Path) -> str | None:
+        out_path = Path(parquet_dir) / f"{video_id:05d}.parquet"
+        if out_path.exists():
+            print(f"  skip {video_path.name} (already done)")
+            return str(out_path)
+
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            print(f"  ERROR: cannot open {video_path.name}")
+            return None
+
+        frames_hwc = []
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
             frame = cv2.resize(frame, (config.width, config.height))
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(frame)
+            frames_hwc.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         cap.release()
-        return frames
 
-    def window_starts(n: int) -> list[int]:
-        return list(range(0, n - config.context_len + 1, config.context_len))
+        if len(frames_hwc) < config.context_len:
+            print(f"  skip {video_path.name}: too short ({len(frames_hwc)} frames)")
+            return None
 
-    total_frames = 0
-
-    features = Features(
-        {
-            "episode": Value("string"),
-            "step": Value("int32"),
-            "frame": HFImage(),
-            "action": Sequence(Value("int32")),
-        }
-    )
-
-    for video_path in tqdm(video_files, desc="Labelizing"):
-        dataset_path = data_dir / f"{video_path.stem}"
-        if dataset_path.exists():
-            print(f"  skip {video_path.name} (already done)")
-            total_frames += len(HFDataset.load_from_disk(str(dataset_path)))
-            continue
-
-        frames = read_video(video_path)
-        n = len(frames)
-        if n < config.context_len:
-            print(f"  skip {video_path.name}: too short ({n} frames)")
-            continue
-
-        # Convert frames to CHW format for model inference
-        frames_chw = [np.transpose(f, (2, 0, 1)) for f in frames]
-        frames_arr = np.stack(frames_chw)
-        del frames_chw
-
-        starts = window_starts(n)
-        actions_buf = np.zeros((n, config.n_buttons), dtype=np.float32)
-
-        for i in range(0, len(starts), batch_size):
-            batch_starts = starts[i : i + batch_size]
-            batch = torch.from_numpy(
-                np.stack([frames_arr[s : s + config.context_len] for s in batch_starts])
-            ).to(_DEVICE)
-            with torch.no_grad(), torch.amp.autocast(device_type=_DEVICE):
-                acts = (torch.sigmoid(model(batch)) > th).float().cpu().numpy()
-            for b, s in enumerate(batch_starts):
-                actions_buf[s : s + config.context_len] = acts[b]
-
+        frames_arr = np.stack([np.transpose(f, (2, 0, 1)) for f in frames_hwc])
+        actions = infer_actions(frames_arr)
         del frames_arr
+
         if _DEVICE == "cuda":
             torch.cuda.empty_cache()
         gc.collect()
 
-        # Mask copies
+        # Only keep frames covered by at least one window
+        n = len(frames_hwc)
         covered = np.zeros(n, dtype=bool)
-        for s in starts:
+        for s in range(0, n - config.context_len + 1, config.context_len):
             covered[s : s + config.context_len] = True
 
-        # Build dataset with correct structure
-        records = {
-            "episode": [],
-            "step": [],
-            "frame": [],
-            "action": [],
-        }
+        def gen():
+            for i in range(n):
+                if covered[i]:
+                    yield {
+                        "video_id": video_id,
+                        "frame":    Image.fromarray(frames_hwc[i]),
+                        "action":   actions[i].tolist(),
+                    }
 
-        for i in range(n):
-            if covered[i]:
-                # Convert CHW back to HWC for PIL Image
-                frame_hwc = np.transpose(frames[i], (1, 2, 0))
-                pil_frame = Image.fromarray(frame_hwc)
-                action_vec = actions_buf[i].astype(int).tolist()
+        ds = HFDataset.from_generator(
+            gen,
+            features=features,
+            writer_batch_size=1_000,
+        )
+        ds.to_parquet(str(out_path))
+        print(f"  {video_path.name}: {len(ds)} frames → {out_path.name}")
+        del ds, frames_hwc, actions
+        gc.collect()
+        return str(out_path)
 
-                records["episode"].append(video_path.stem)
-                records["step"].append(i)
-                records["frame"].append(pil_frame)
-                records["action"].append(action_vec)
+    parquet_files = []
+    for video_id, video_path in enumerate(
+        tqdm(video_files, desc="Labelizing")
+    ):
+        result = process_video(video_id, video_path)
+        if result:
+            parquet_files.append(result)
 
-        dataset = HFDataset.from_dict(records, features=features)
-        dataset.save_to_disk(str(dataset_path))
-
-        dest = videos_dir / video_path.name
-        if not dest.exists():
-            try:
-                os.link(video_path, dest)
-            except OSError:
-                import shutil
-
-                shutil.copy2(video_path, dest)
-
-        total_frames += len(dataset)
-        print(f"  {video_path.name}: {len(dataset)} frames labeled")
-
-    if total_frames == 0:
+    if not parquet_files:
         raise RuntimeError("No frames were labeled.")
 
-    print(f"\nUploading to {repo_id}  ({total_frames} frames)")
+    print(f"\nUploading {len(parquet_files)} parquet shards to {repo_id} ...")
     api = HfApi()
     api.create_repo(repo_id, repo_type="dataset", private=private, exist_ok=True)
     api.upload_large_folder(
-        folder_path=str(upload_dir),
+        folder_path=parquet_dir,
         repo_id=repo_id,
         repo_type="dataset",
         num_workers=16,
     )
-    print("Upload done!")
-
+    print("Done!")
 
 if __name__ == "__main__":
     import argparse

@@ -429,16 +429,17 @@ def labelize_and_publish(
     repo_id: str = "lucrbrtv/doom-e1-internet",
     private: bool = False,
     thresholds: list[float] | None = None,
-    batch_size: int = 128,
+    batch_size: int = 64,
     cache_dir: str = "./data/cache/labelize",
 ):
-    """Labelize videos and publish to HF.
-
-      1. Inference: one video at a time, save ctions to disk.
-      2. Push: generator re-reads videos + loads actions and push to HF Hub
-
-    It avoid us to store every frames in RAM
     """
+    Labelize gameplay videos with a pre-trained IDM and push to huggingface
+    """
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1") # requires at least 64 GB of RAM
+
+    import pandas as pd
+    from huggingface_hub import HfApi
+
     config = config or IDMConfig()
     model = load_idm(weights_path, config).to(_DEVICE).eval()
 
@@ -447,7 +448,12 @@ def labelize_and_publish(
         raise ValueError(f"No MP4 files found in {video_folder}")
 
     th = torch.tensor(thresholds or [0.5] * config.n_buttons, device=_DEVICE)
-    os.makedirs(cache_dir, exist_ok=True)
+
+    upload_dir = Path(cache_dir) / "upload"
+    videos_dir = upload_dir / "videos"
+    data_dir   = upload_dir / "data"
+    videos_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
 
     def read_video(path: Path) -> list[np.ndarray]:
         cap = cv2.VideoCapture(str(path))
@@ -465,14 +471,19 @@ def labelize_and_publish(
     def window_starts(n: int) -> list[int]:
         return list(range(0, n - config.context_len + 1, config.context_len))
 
-    # Phase 1: inference
-    video_meta = []  # (video_path, actions_path, n_frames)
+    total_frames = 0
 
     for video_path in tqdm(video_files, desc="Labelizing"):
+        parquet_path = data_dir / f"{video_path.stem}.parquet"
+        if parquet_path.exists():
+            print(f"  skip {video_path.name} (already done)")
+            total_frames += len(pd.read_parquet(parquet_path))
+            continue
+
         frames = read_video(video_path)
         n = len(frames)
         if n < config.context_len:
-            print(f"Skipping {video_path.name}: too short ({n} frames)")
+            print(f"  skip {video_path.name}: too short ({n} frames)")
             continue
 
         frames_arr = np.stack(frames)
@@ -491,46 +502,49 @@ def labelize_and_publish(
             for b, s in enumerate(batch_starts):
                 actions_buf[s : s + config.context_len] = acts[b]
 
-        # Keep only frames covered by a window
-        covered = np.zeros(n, dtype=bool)
-        for s in starts:
-            covered[s : s + config.context_len] = True
-
-        actions_path = os.path.join(cache_dir, f"{video_path.stem}_actions.npy")
-        np.save(actions_path, actions_buf[covered])
-        video_meta.append((video_path, actions_path, n))
-        print(f"{video_path.name}: {covered.sum()} frames labeled")
-
-        del frames_arr, actions_buf, covered
+        del frames_arr
         if _DEVICE == "cuda":
             torch.cuda.empty_cache()
         gc.collect()
 
-    if not video_meta:
+        # Mask copies
+        covered = np.zeros(n, dtype=bool)
+        for s in starts:
+            covered[s : s + config.context_len] = True
+        covered_indices = np.where(covered)[0]
+
+        df = pd.DataFrame(
+            actions_buf[covered],
+            columns=[f"action_{i}" for i in range(config.n_buttons)],
+        )
+        df.insert(0, "frame_idx", covered_indices)
+        df.insert(0, "episode",   video_path.stem)
+        df.to_parquet(parquet_path, index=False, compression="zstd")
+
+        dest = videos_dir / video_path.name
+        if not dest.exists():
+            try:
+                os.link(video_path, dest)
+            except OSError:
+                import shutil
+                shutil.copy2(video_path, dest)
+
+        total_frames += covered.sum()
+        print(f"  {video_path.name}: {int(covered.sum())} frames labeled")
+
+    if total_frames == 0:
         raise RuntimeError("No frames were labeled.")
 
-    total = sum(np.load(a, mmap_mode="r").shape[0] for _, a, _ in video_meta)
-    print(f"Building dataset ({total} frames) — re-reading videos for Arrow conversion…")
-
-    # Phase 2: push
-    def sample_generator():
-        for video_path, actions_path, n in video_meta:
-            frames = read_video(video_path)
-            actions = np.load(actions_path)
-            episode = video_path.stem
-            covered = np.zeros(n, dtype=bool)
-            for s in window_starts(n):
-                covered[s : s + config.context_len] = True
-            j = 0
-            for frame, is_covered in zip(frames, covered):
-                if is_covered:
-                    yield {"episode": episode, "frame": frame, "action": actions[j].tolist()}
-                    j += 1
-            del frames
-
-    dataset = HFDataset.from_generator(sample_generator, num_proc=16)
-    dataset.push_to_hub(repo_id, private=private)
-    print(f"Published {len(dataset)} frames to {repo_id}")
+    print(f"\nUploading to {repo_id}  ({total_frames} frames)")
+    api = HfApi()
+    api.create_repo(repo_id, repo_type="dataset", private=private, exist_ok=True)
+    api.upload_large_folder(
+        folder_path=str(upload_dir),
+        repo_id=repo_id,
+        repo_type="dataset",
+        num_workers=16,
+    )
+    print("Upload done!")
 
 if __name__ == "__main__":
     import argparse

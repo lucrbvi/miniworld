@@ -3,13 +3,15 @@ name = "miniworld"
 version = "0.1.0"
 description = "Small Latent World Model"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12,<3.14"
 license = "MIT"
 dependencies = [
   "accelerate>=1.13.0",
-  "datasets>=4.6.1",
+  "datasets>=3.5",
+  "dill>=0.4.0",
   "dotenv>=0.9.9",
   "kernels>=0.12.2",
+  "multiprocess>=0.70.18",
   "numpy>=2.4.2",
   "opencv-python>=4.13.0.92",
   "pandas>=3.0.1",

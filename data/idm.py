@@ -228,15 +228,24 @@ class IDMDataset(torch.utils.data.Dataset):
             actions_arr.shape[0],
             *self._infer_chw(frames_path, actions_arr.shape[0]),
         )
-        self.frames_mm = np.memmap(
-            frames_path,
-            dtype=np.uint8,
-            mode="r",
-            shape=(n_frames, *chw),
-        )
+        self._frames_mm = None
+        self.frames_path = frames_path
+        self.n_frames = actions_arr.shape[0]
         self.actions_arr = actions_arr
+        self.chw = self._infer_chw(frames_path, self.n_frames)
         self.valid_indices = valid_indices
         self.context_len = context_len
+
+    @property
+    def frames_mm(self):
+        if self._frames_mm is None:
+            self._frames_mm = np.memmap(
+                self.frames_path,
+                dtype=np.uint8,
+                mode="r",
+                shape=(self.n_frames, *self.chw),
+            )
+        return self._frames_mm
 
     @staticmethod
     def _infer_chw(frames_path: str, n_frames: int) -> tuple[int, int, int]:

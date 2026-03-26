@@ -30,13 +30,15 @@ from torch import Tensor
 from PIL import Image
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
-from datasets import load_dataset, Dataset as HFDataset
+from datasets import load_dataset, Dataset as HFDataset,Features, Sequence, Value, Image as HFImage
 from transformers import (
     Trainer,
     TrainingArguments,
     PreTrainedModel,
     PretrainedConfig,
+    AutoModel
 )
+from huggingface_hub import HfApi
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -411,7 +413,6 @@ def load_idm(
     config = config or IDMConfig()
 
     if os.path.isdir(model_path):
-        from transformers import AutoModel
         model = AutoModel.from_pretrained(model_path)
     elif model_path.endswith(".safetensors"):
         model = IDM(config)
@@ -435,10 +436,7 @@ def labelize_and_publish(
     """
     Labelize gameplay videos with a pre-trained IDM and push to huggingface
     """
-    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1") # requires at least 64 GB of RAM
-
-    import pandas as pd
-    from huggingface_hub import HfApi
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")  # requires at least 64 GB of RAM
 
     config = config or IDMConfig()
     model = load_idm(weights_path, config).to(_DEVICE).eval()
@@ -451,7 +449,7 @@ def labelize_and_publish(
 
     upload_dir = Path(cache_dir) / "upload"
     videos_dir = upload_dir / "videos"
-    data_dir   = upload_dir / "data"
+    data_dir = upload_dir / "data"
     videos_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -464,7 +462,7 @@ def labelize_and_publish(
                 break
             frame = cv2.resize(frame, (config.width, config.height))
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(np.transpose(frame, (2, 0, 1)))
+            frames.append(frame)
         cap.release()
         return frames
 
@@ -473,11 +471,20 @@ def labelize_and_publish(
 
     total_frames = 0
 
+    features = Features(
+        {
+            "episode": Value("string"),
+            "step": Value("int32"),
+            "frame": HFImage(),
+            "action": Sequence(Value("int32")),
+        }
+    )
+
     for video_path in tqdm(video_files, desc="Labelizing"):
-        parquet_path = data_dir / f"{video_path.stem}.parquet"
-        if parquet_path.exists():
+        dataset_path = data_dir / f"{video_path.stem}"
+        if dataset_path.exists():
             print(f"  skip {video_path.name} (already done)")
-            total_frames += len(pd.read_parquet(parquet_path))
+            total_frames += len(HFDataset.load_from_disk(str(dataset_path)))
             continue
 
         frames = read_video(video_path)
@@ -486,8 +493,10 @@ def labelize_and_publish(
             print(f"  skip {video_path.name}: too short ({n} frames)")
             continue
 
-        frames_arr = np.stack(frames)
-        del frames
+        # Convert frames to CHW format for model inference
+        frames_chw = [np.transpose(f, (2, 0, 1)) for f in frames]
+        frames_arr = np.stack(frames_chw)
+        del frames_chw
 
         starts = window_starts(n)
         actions_buf = np.zeros((n, config.n_buttons), dtype=np.float32)
@@ -511,15 +520,29 @@ def labelize_and_publish(
         covered = np.zeros(n, dtype=bool)
         for s in starts:
             covered[s : s + config.context_len] = True
-        covered_indices = np.where(covered)[0]
 
-        df = pd.DataFrame(
-            actions_buf[covered],
-            columns=[f"action_{i}" for i in range(config.n_buttons)],
-        )
-        df.insert(0, "frame_idx", covered_indices)
-        df.insert(0, "episode",   video_path.stem)
-        df.to_parquet(parquet_path, index=False, compression="zstd")
+        # Build dataset with correct structure
+        records = {
+            "episode": [],
+            "step": [],
+            "frame": [],
+            "action": [],
+        }
+
+        for i in range(n):
+            if covered[i]:
+                # Convert CHW back to HWC for PIL Image
+                frame_hwc = np.transpose(frames[i], (1, 2, 0))
+                pil_frame = Image.fromarray(frame_hwc)
+                action_vec = actions_buf[i].astype(int).tolist()
+
+                records["episode"].append(video_path.stem)
+                records["step"].append(i)
+                records["frame"].append(pil_frame)
+                records["action"].append(action_vec)
+
+        dataset = HFDataset.from_dict(records, features=features)
+        dataset.save_to_disk(str(dataset_path))
 
         dest = videos_dir / video_path.name
         if not dest.exists():
@@ -527,10 +550,11 @@ def labelize_and_publish(
                 os.link(video_path, dest)
             except OSError:
                 import shutil
+
                 shutil.copy2(video_path, dest)
 
-        total_frames += covered.sum()
-        print(f"  {video_path.name}: {int(covered.sum())} frames labeled")
+        total_frames += len(dataset)
+        print(f"  {video_path.name}: {len(dataset)} frames labeled")
 
     if total_frames == 0:
         raise RuntimeError("No frames were labeled.")
@@ -545,6 +569,7 @@ def labelize_and_publish(
         num_workers=16,
     )
     print("Upload done!")
+
 
 if __name__ == "__main__":
     import argparse
@@ -577,7 +602,7 @@ if __name__ == "__main__":
         height=240,
         width=320,
         patch_size=16,
-        dim=384, # head_size must be divisible by 8
+        dim=384,  # head_size must be divisible by 8
         n_heads=16,
         n_blocks=4,
         ffn_mult=3,

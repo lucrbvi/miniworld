@@ -4,6 +4,10 @@ Paper: Video PreTraining (VPT) [Baker et al., 2022] https://arxiv.org/abs/2206.1
 Dataset: https://huggingface.co/datasets/lucrbrtv/doom-e1-gameplay
 """
 
+# fix to not crash b.c. of semaphores
+import torch.multiprocessing as mp
+mp.set_sharing_strategy("file_system")
+
 import os
 import sys
 import wandb
@@ -34,7 +38,7 @@ from transformers import (
 )
 from huggingface_hub import HfApi
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from model import MHAttention
@@ -46,7 +50,7 @@ _DEVICE = (
     if torch.mps.is_available()
     else "cpu"
 )
-print(_DEVICE)
+print(f"device: {_DEVICE}")
 
 class IDMConfig(PretrainedConfig):
     model_type = "idm"
@@ -420,28 +424,18 @@ def load_idm(
 
 def read_video(path: str) -> torch.Tensor:
     cap = cv.VideoCapture(path)
-    frames = []
+    try:
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames.append(cv.cvtColor(frame, cv.COLOR_BGR2RGB))
+    finally:
+        cap.release()
+    return torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).float() / 255.0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        # BGR -> RGB, HWC -> CHW
-        frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-        frames.append(frame)
-
-    cap.release()
-
-    # (T, H, W, C) -> (T, C, H, W), normalized [0, 1]
-    tensor = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2)
-    return tensor.float() / 255.0
-
-def read_videos_from_folder(path: str) -> torch.Tensor:
-    video_paths = [str(p) for p in Path(path).glob("*.mp4")]
-    with ThreadPoolExecutor(max_workers=12) as executor:
-        videos = list(executor.map(read_video, path))
-    return torch.cat(videos, dim=0) # batched
-
+# really bad design; need to stream to the dataset or at least save on disk (parquet) videos to not OOM
 def labelize_and_publish(
     weights_path: str,
     video_folder: str,
@@ -451,26 +445,31 @@ def labelize_and_publish(
     parquet_dir: str = "./data/cache/labelize/parquet",
     private: bool = False,
 ):
-    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
-    os.makedirs(parquet_dir, exist_ok=True)
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1") # REQUIRES AT LEAST 64 GB OF RAM!!
 
     config = config or IDMConfig()
-    videos = read_videos_from_folder(video_folder)
     model = load_idm(weights_path, config)
-
-    B = videos.shape[0]
     context_len = config.context_len
+
     all_frames, all_actions = [], []
 
-    for start in tqdm(range(0, B - context_len, context_len), desc="Labelizing"):
-        window = videos[start : start + context_len].unsqueeze(0).to(_DEVICE)
-        with torch.no_grad():
-            preds = (torch.sigmoid(model(window)) > 0.5).float().squeeze(0)#.cpu()
-        all_frames.extend([videos[start + t] for t in range(context_len - 1)])
-        all_actions.extend(preds[:-1].numpy().tolist())
+    for p in sorted(Path(video_folder).glob("*.mp4")):
+        video = read_video(str(p))
+        T = video.shape[0]
+        print(f"OK {p.name} ({T} frames)")
+
+        for start in tqdm(range(0, T - context_len, context_len), desc=p.name):
+            window = video[start : start + context_len].unsqueeze(0).to(_DEVICE)
+            with torch.no_grad():
+                preds = (torch.sigmoid(model(window)) > 0.5).float().squeeze(0).cpu()
+            all_frames.extend(video[start : start + context_len - 1])
+            all_actions.extend(preds[:-1].numpy().tolist())
 
     ds = HFDataset.from_dict({
-        "frame":  [Image.fromarray((f.permute(1, 2, 0).numpy() * 255).astype(np.uint8)) for f in all_frames],
+        "frame": [
+            Image.fromarray((f.permute(1, 2, 0).numpy() * 255).astype(np.uint8))
+            for f in all_frames
+        ],
         "action": all_actions,
     })
     ds.push_to_hub(repo_id, private=private)
@@ -506,7 +505,7 @@ if __name__ == "__main__":
         height=240,
         width=320,
         patch_size=16,
-        dim=384,  # head_size must be divisible by 8
+        dim=384, # head_size must be divisible by 8
         n_heads=16,
         n_blocks=4,
         ffn_mult=3,

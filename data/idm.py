@@ -431,57 +431,68 @@ def load_idm(
 
     return model.to(_DEVICE).eval()
 
-def read_video(path: str) -> torch.Tensor:
-    cap = cv.VideoCapture(path)
-    try:
-        frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frames.append(cv.cvtColor(frame, cv.COLOR_BGR2RGB))
-    finally:
-        cap.release()
-    return torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).float() / 255.0
-
-# really bad design; need to stream to the dataset or at least save on disk (parquet) videos to not OOM
 def labelize_and_publish(
     weights_path: str,
     video_folder: str,
     repo_id: str = "lucrbrtv/doom-e1-internet",
     config: IDMConfig | None = None,
-    batch_size: int = 64,
+    shard_size: int = 10_000,
     parquet_dir: str = "./data/cache/labelize/parquet",
     private: bool = False,
-):
-    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1") # REQUIRES AT LEAST 64 GB OF RAM!!
-
+) -> None:
+    os.makedirs(parquet_dir, exist_ok=True)
     config = config or IDMConfig()
-    model = load_idm(weights_path, config)
     context_len = config.context_len
+    model = load_idm(weights_path, config)
 
-    all_frames, all_actions = [], []
+    video_paths = sorted(Path(video_folder).glob("*.[mM][pP]4"))
+    if not video_paths:
+        raise FileNotFoundError(f"No .mp4 files in {video_folder}")
+    print(f"Found {len(video_paths)} videos")
 
-    for p in sorted(Path(video_folder).glob("*.mp4")):
-        video = read_video(str(p))
-        T = video.shape[0]
-        print(f"OK {p.name} ({T} frames)")
+    frames_buf, actions_buf, shard_idx = [], [], 0
 
-        for start in tqdm(range(0, T - context_len, context_len), desc=p.name):
-            window = video[start : start + context_len].unsqueeze(0).to(_DEVICE)
+    def flush():
+        nonlocal frames_buf, actions_buf, shard_idx
+        if not frames_buf:
+            return
+        path = f"{parquet_dir}/shard_{shard_idx:04d}.parquet"
+        HFDataset.from_dict({"frame": frames_buf, "action": actions_buf}).to_parquet(path)
+        print(f"shard {shard_idx:04d}: {len(frames_buf)} records → {path}")
+        frames_buf, actions_buf, shard_idx = [], [], shard_idx + 1
+
+    for vid_path in video_paths:
+        cap = cv.VideoCapture(str(vid_path))
+        window = []
+
+        while True:
+            ret, bgr = cap.read()
+            if not ret:
+                break
+            window.append(np.transpose(cv.cvtColor(bgr, cv.COLOR_BGR2RGB), (2, 0, 1)))
+            if len(window) < context_len:
+                continue
+
+            t = torch.from_numpy(np.stack(window)).unsqueeze(0).to(_DEVICE)
             with torch.no_grad():
-                preds = (torch.sigmoid(model(window)) > 0.5).float().squeeze(0).cpu()
-            all_frames.extend(video[start : start + context_len - 1])
-            all_actions.extend(preds[:-1].numpy().tolist())
+                preds = (torch.sigmoid(model(t)) > 0.5).float().squeeze(0).cpu()
 
-    ds = HFDataset.from_dict({
-        "frame": [
-            Image.fromarray((f.permute(1, 2, 0).numpy() * 255).astype(np.uint8))
-            for f in all_frames
-        ],
-        "action": all_actions,
-    })
-    ds.push_to_hub(repo_id, private=private)
+            for i in range(context_len - 1):
+                frames_buf.append(Image.fromarray(np.transpose(window[i], (1, 2, 0))))
+                actions_buf.append(preds[i].numpy().tolist())
+
+            window = []
+            if len(frames_buf) >= shard_size:
+                flush()
+
+        cap.release()
+        flush()
+
+    api = HfApi()
+    api.create_repo(repo_id, repo_type="dataset", exist_ok=True, private=private)
+    for p in sorted(Path(parquet_dir).glob("shard_*.parquet")):
+        api.upload_file(path_or_fileobj=str(p), path_in_repo=f"data/{p.name}", repo_id=repo_id, repo_type="dataset")
+    print("Dataset uploaded")
 
 if __name__ == "__main__":
     import argparse

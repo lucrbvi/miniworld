@@ -9,6 +9,7 @@ import torch.multiprocessing as mp
 mp.set_sharing_strategy("file_system")
 
 import os
+import io
 import sys
 import wandb
 import numpy as np
@@ -431,68 +432,109 @@ def load_idm(
 
     return model.to(_DEVICE).eval()
 
+
 def labelize_and_publish(
     weights_path: str,
     video_folder: str,
-    repo_id: str = "lucrbrtv/doom-e1-internet",
+    repo_id: str = "lucrbrtv/doom-e1-internet-gameplay",
     config: IDMConfig | None = None,
-    shard_size: int = 10_000,
-    parquet_dir: str = "./data/cache/labelize/parquet",
+    parquet_dir: str = "./data/cache/labelize",
     private: bool = False,
 ) -> None:
-    os.makedirs(parquet_dir, exist_ok=True)
     config = config or IDMConfig()
-    context_len = config.context_len
     model = load_idm(weights_path, config)
-
     video_paths = sorted(Path(video_folder).glob("*.[mM][pP]4"))
-    if not video_paths:
-        raise FileNotFoundError(f"No .mp4 files in {video_folder}")
     print(f"Found {len(video_paths)} videos")
+    os.makedirs(parquet_dir, exist_ok=True)
 
-    frames_buf, actions_buf, shard_idx = [], [], 0
+    C, CHUNK, BATCH, SHARD = config.context_len, 512, 32, 5_000
+    frames_buf, actions_buf, video_idx_buf, frame_idx_buf, shard_idx = [], [], [], [], 0
+    global_frame_idx = 0
+
+    def to_jpeg_bytes(arr: np.ndarray, quality: int = 85) -> bytes:
+        img = Image.fromarray(np.transpose(arr, (1, 2, 0)))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+        return buf.getvalue()
 
     def flush():
-        nonlocal frames_buf, actions_buf, shard_idx
-        if not frames_buf:
-            return
+        nonlocal frames_buf, actions_buf, video_idx_buf, frame_idx_buf, shard_idx, global_frame_idx
         path = f"{parquet_dir}/shard_{shard_idx:04d}.parquet"
-        HFDataset.from_dict({"frame": frames_buf, "action": actions_buf}).to_parquet(path)
-        print(f"shard {shard_idx:04d}: {len(frames_buf)} records → {path}")
-        frames_buf, actions_buf, shard_idx = [], [], shard_idx + 1
+        ds = HFDataset.from_dict(
+            {
+                "video_idx": video_idx_buf,
+                "frame_idx": frame_idx_buf,
+                "frame": frames_buf,
+                "action": actions_buf,
+            },
+            features=Features(
+                {
+                    "video_idx": Value("int32"),
+                    "frame_idx": Value("int32"),
+                    "frame": HFImage(),
+                    "action": Sequence(Value("float32")),
+                }
+            ),
+        )
+        ds.to_parquet(path)
+        print(f"  shard {shard_idx:04d}: {len(frames_buf)} frames -> {path}")
+        frames_buf, actions_buf, video_idx_buf, frame_idx_buf, shard_idx = (
+            [],
+            [],
+            [],
+            [],
+            shard_idx + 1,
+        )
 
-    for vid_path in video_paths:
+    for vid_idx, vid_path in enumerate(tqdm(video_paths, desc="Videos")):
         cap = cv.VideoCapture(str(vid_path))
-        window = []
+        n_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
 
-        while True:
-            ret, bgr = cap.read()
-            if not ret:
-                break
-            window.append(np.transpose(cv.cvtColor(bgr, cv.COLOR_BGR2RGB), (2, 0, 1)))
-            if len(window) < context_len:
-                continue
+        with tqdm(total=n_frames, desc=vid_path.name, leave=False) as pbar:
+            while True:
+                chunk = []
+                for _ in range(CHUNK):
+                    ret, bgr = cap.read()
+                    if not ret or bgr is None or bgr.size == 0:
+                        break
+                    rgb = cv.resize(
+                        cv.cvtColor(bgr, cv.COLOR_BGR2RGB),
+                        (config.width, config.height),
+                    )
+                    chunk.append(np.transpose(rgb, (2, 0, 1)))
+                    pbar.update(1)
+                if not chunk:
+                    break
 
-            t = torch.from_numpy(np.stack(window)).unsqueeze(0).to(_DEVICE)
-            with torch.no_grad():
-                preds = (torch.sigmoid(model(t)) > 0.5).float().squeeze(0).cpu()
+                windows = [chunk[i : i + C] for i in range(0, len(chunk) - C + 1, C)]
+                for i in range(0, len(windows), BATCH):
+                    batch = windows[i : i + BATCH]
+                    t = torch.from_numpy(np.stack([np.stack(w) for w in batch])).to(
+                        _DEVICE
+                    )
+                    with torch.no_grad():
+                        preds = (torch.sigmoid(model(t)) > 0.5).float().cpu().numpy()
+                    for j, window in enumerate(batch):
+                        for k in range(C - 1):
+                            frames_buf.append(to_jpeg_bytes(window[k]))
+                            actions_buf.append(preds[j][k].tolist())
+                            video_idx_buf.append(vid_idx)
+                            frame_idx_buf.append(global_frame_idx)
+                            global_frame_idx += 1
 
-            for i in range(context_len - 1):
-                frames_buf.append(Image.fromarray(np.transpose(window[i], (1, 2, 0))))
-                actions_buf.append(preds[i].numpy().tolist())
-
-            window = []
-            if len(frames_buf) >= shard_size:
-                flush()
+                if len(frames_buf) >= SHARD:
+                    flush()
 
         cap.release()
+
+    if frames_buf:
         flush()
 
-    api = HfApi()
-    api.create_repo(repo_id, repo_type="dataset", exist_ok=True, private=private)
-    for p in sorted(Path(parquet_dir).glob("shard_*.parquet")):
-        api.upload_file(path_or_fileobj=str(p), path_in_repo=f"data/{p.name}", repo_id=repo_id, repo_type="dataset")
-    print("Dataset uploaded")
+    print("Uploading to HuggingFace...")
+    load_dataset("parquet", data_files=f"{parquet_dir}/shard_*.parquet").push_to_hub(
+        repo_id, private=private
+    )
+    print("Done!")
 
 if __name__ == "__main__":
     import argparse

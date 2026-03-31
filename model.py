@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from transformers import PreTrainedModel, PretrainedConfig
 from kernels import get_kernel
 
 _DEVICE = (
@@ -162,46 +163,135 @@ class MHAttention(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, config: dict):
         super().__init__()
-        last_dim = config["height"] * config["width"]
         self.dim = config["dim"]
+        patch_dim = config["patch_size"] * config["patch_size"] * 3
 
         self.model = nn.Sequential(
             nn.Linear(self.dim, self.dim * 5),
             nn.GELU(),
             nn.Linear(self.dim * 5, self.dim * 5),
             nn.GELU(),
-            nn.Linear(self.dim * 5, last_dim),
+            nn.Linear(self.dim * 5, patch_dim),
         )
 
     def forward(self, x: Tensor):
-        if x.dim() == 2:
-            return self.model(x)
-
         B, N, D = x.shape
-        out = self.model(x.view(B * N, D)).view(B, N, -1)
+        out = self.model(x.view(B * N, D))
+        return out.view(B, N, -1)
 
-        return out  # (B, N, H*W)
+# (B, N, patch_size*patch_size*3) -> (B, 3, H, W)
+def fold_patches(x: Tensor, height: int, width: int, patch_size: int) -> Tensor:
+    B = x.size(0)
+    n_h = height // patch_size
+    n_w = width // patch_size
 
-class WorldModel(nn.Module):
-    def __init__(self, config: dict):
+    # (B, N, 3, p, p) -> (B, n_h, n_w, 3, p, p)
+    x = x.view(B, n_h, n_w, 3, patch_size, patch_size)
+
+    # (B, 3, H, W)
+    x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
+    return x.view(B, 3, height, width)
+
+class WorldModelConfig(PretrainedConfig):
+    model_type = "world_model"
+
+    def __init__(
+        self,
+        height: int = 240,
+        width: int = 320,
+        patch_size: int = 16,
+        dim: int = 256,
+        n_heads: int = 4,
+        n_blocks: int = 3,
+        ffn_mult: int = 3,
+        dropout_proba: float = 0.1,
+        **kwargs,
+    ):
+        self.height = height
+        self.width = width
+        self.patch_size = patch_size
+        self.dim = dim
+        self.n_heads = n_heads
+        self.n_blocks = n_blocks
+        self.ffn_mult = ffn_mult
+        self.dropout_proba = dropout_proba
+        super().__init__(**kwargs)
+
+class ActionEmbedding(nn.Module):
+    def __init__(self, action_dim: int, model_dim: int):
         super().__init__()
-        self.encoder = VisionEncoder(config)
-        self.transformer = MHAttention(config)
-        self.decoder = Decoder(config)
+        self.proj = nn.Linear(action_dim, model_dim)
 
-        self.cls_token = nn.Parameter(torch.randn(1, 1, config["dim"]))
+    def forward(self, action: Tensor) -> Tensor:
+        return self.proj(action.float()).unsqueeze(1)  # (B, action_dim) -> (B, 1, model_dim)
 
-    def forward(self, x: Tensor):
+class WorldModel(PreTrainedModel):
+    config_class = WorldModelConfig
+
+    def __init__(self, config: WorldModelConfig):
+        super().__init__(config)
+        mh_config = {
+            "dim": config.dim,
+            "n_heads": config.n_heads,
+            "n_blocks": config.n_blocks,
+            "ffn_mult": config.ffn_mult,
+            "dropout_proba": config.dropout_proba,
+        }
+        self.encoder = VisionEncoder(
+            {
+                **mh_config,
+                "height": config.height,
+                "width": config.width,
+                "patch_size": config.patch_size,
+            }
+        )
+        self.transformer = MHAttention(mh_config)
+        self.decoder = Decoder(
+            {
+                **mh_config,
+                "height": config.height,
+                "width": config.width,
+                "patch_size": config.patch_size,
+            }
+        )
+
+        self.action_embedding = ActionEmbedding(action_dim=9, model_dim=config.dim)
+
+        self.cls_token = nn.Parameter(torch.randn(1, 1, config.dim))
+
+    def forward(self, x: Tensor, action: Tensor):
+        # Handle both (B, C, H, W) and (B, M, C, H, W) inputs
+        if x.dim() == 5:
+            B, M, C, H, W = x.shape
+            x = x.view(B * M, C, H, W)
+            is_sequence = True
+        else:
+            B = x.size(0)
+            M = 1
+            is_sequence = False
+
         x = self.encoder(x)
 
-        B = x.size(0)
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls_tokens, x], dim=1)
+        B_total = x.size(0)
+        cls_tokens = self.cls_token.expand(B_total, -1, -1)
+        if is_sequence:
+            action = action.view(B_total, -1)
+        action_tokens = self.action_embedding(action)
 
+        # adding action tokens like this maybe hard to infer dynamics, need to try mixing with frames
+        x = torch.cat([cls_tokens, action_tokens, x], dim=1)
         x = self.transformer(x)
 
-        cls = x[:, 0, :]
+        patches = x[:, 0, :]
+        decoded = self.decoder(patches)
 
-        return self.decoder(
-            cls
-        )  # TODO: the decoder should receive all the patches to generate good frames
+        if is_sequence:
+            patches = patches.view(B, M, -1, self.config.dim)
+            decoded = decoded.view(B, M, -1)
+
+        return patches, fold_patches(
+            decoded,
+            self.config.height,
+            self.config.width,
+            self.config.patch_size,
+        )

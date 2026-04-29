@@ -20,7 +20,7 @@ import cv2 as cv
 
 from torch import Tensor
 from PIL import Image
-from safetensors.torch import load_model, load_file, save_file
+from safetensors.torch import load_file
 from tqdm import tqdm
 from datasets import (
     load_dataset,
@@ -37,9 +37,7 @@ from transformers import (
     PretrainedConfig,
     AutoModel,
 )
-from huggingface_hub import HfApi
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from model import MHAttention
@@ -225,10 +223,6 @@ class IDMDataset(torch.utils.data.Dataset):
         valid_indices: list[int],
         context_len: int,
     ):
-        n_frames, *chw = (
-            actions_arr.shape[0],
-            *self._infer_chw(frames_path, actions_arr.shape[0]),
-        )
         self._frames_mm = None
         self.frames_path = frames_path
         self.n_frames = actions_arr.shape[0]
@@ -417,7 +411,6 @@ def train(
 def load_idm(
     model_path: str,
     config: IDMConfig | None = None,
-    device: str = _DEVICE,
 ) -> IDM:
     config = config or IDMConfig()
 
@@ -431,7 +424,6 @@ def load_idm(
         raise ValueError(f"Unsupported format: {model_path}")
 
     return model.to(_DEVICE).eval()
-
 
 def labelize_and_publish(
     weights_path: str,

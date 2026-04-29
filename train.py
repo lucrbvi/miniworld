@@ -1,16 +1,17 @@
-import torch
-import torch.nn as nn
-import wandb
 import lejepa
 import numpy as np
-
-from torch import Tensor
+import torch
+import torch.nn as nn
 from datasets import (
-    load_dataset,
     Dataset as HFDataset,
 )
-from model import WorldModel, WorldModelConfig
+from datasets import (
+    load_dataset,
+)
 from transformers import Trainer, TrainingArguments
+
+import wandb
+from model import WorldModel, WorldModelConfig
 
 class WMDataset(torch.utils.data.Dataset):
     """Dataset for World Model that stacks M frames and actions as context."""
@@ -59,17 +60,18 @@ _DEVICE = (
     else "cpu"
 )
 
-LAMBDA = 0.1 # Sigreg
-LAMBDA2 = 0.3 # latent / pixels
-
 # Create and apply a binary mask to let n_visible masks visible on multiple frames
 # (it generate a new random mask for each frames)
 def make_mask(B, M, H, W, n_visible, device, patch_size=16):
     ph, pw = H // patch_size, W // patch_size
-    idx = torch.stack([torch.randperm(ph * pw, device=device)[:n_visible] for _ in range(B * M)])
+    idx = torch.stack(
+        [torch.randperm(ph * pw, device=device)[:n_visible] for _ in range(B * M)]
+    )
     mask = torch.zeros(B * M, ph * pw, device=device).scatter_(1, idx, 1.0)
     mask = mask.view(B, M, ph, pw).unsqueeze(2)
-    return mask.repeat_interleave(patch_size, -2).repeat_interleave(patch_size, -1) # (B, M, 1, H, W)
+    return mask.repeat_interleave(patch_size, -2).repeat_interleave(
+        patch_size, -1
+    )  # (B, M, 1, H, W)
 
 class WMTrainer(Trainer):
     def __init__(self, *args, **kwargs):
@@ -81,32 +83,68 @@ class WMTrainer(Trainer):
 
     # We are training the world model and the decoder at the same time
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        frames = inputs["frames"]
-        next = inputs["next_frame"]
+        frames = inputs["frames"]  # [B, M, C, H, W]
+        next_frame = inputs["next_frame"]
         actions = inputs["actions"]
+
         B, M, C, H, W = frames.shape
+        device = frames.device
 
-        global_views = [
-            frames * make_mask(B, M, H, W, n_visible=2, device=frames.device)
+        n_views = 6
+        lambda_sigreg = 0.05
+        lambda_pixel = 0.1
+
+        views = [
+            frames
+            * make_mask(
+                B,
+                M,
+                H,
+                W,
+                n_visible=6,
+                device=device,
+            )
+            for _ in range(n_views)
         ]
-        all_views = [frames * make_mask(B, M, H, W, n_visible=6, device=frames.device)]
 
-        # Don't know if it breaks LeJEPA to add actions w/ masked images
-        g_emb, _ = model(torch.cat(global_views), actions)
-        a_emb, _ = model(torch.cat(all_views), actions)
-        _, pixel_pred = model(frames, actions)
+        x_views = torch.cat(views, dim=0)  # [n_views * B, M, C, H, W]
+        actions_views = actions.repeat(n_views, *([1] * (actions.ndim - 1)))
 
-        K = g_emb.shape[-1]
+        pred_next_emb, pixel_pred = model(x_views, actions_views)
 
-        centers = g_emb.view(-1, B, K).mean(0)
-        a_emb = a_emb.view(-1, B, K)
-        sim = (centers - a_emb).square().mean()
+        K = pred_next_emb.shape[-1]
+        pred_next_emb = pred_next_emb.view(n_views, B, K)  # [V, B, K]
 
-        sigreg = self.sigreg_loss_fn(a_emb.view(-1, K))
-        pixels = nn.functional.mse_loss(pixel_pred, next)
-        loss = (1 - LAMBDA2) * ((1 - LAMBDA) * sim + LAMBDA * sigreg) + pixels * LAMBDA2
+        target_next_emb = model.encoder(next_frame)
+        target_next_emb = target_next_emb.view(B, K)  # [B, K]
 
-        return (loss, {"g_embeddings": g_emb, "a_embeddings": a_emb, "pixel_pred": pixel_pred}) if return_outputs else loss
+        latent_pred_loss = (pred_next_emb - target_next_emb[None]).square().mean()
+
+        sigreg_pred = torch.stack(
+            [self.sigreg_loss_fn(pred_next_emb[v]) for v in range(n_views)]
+        ).mean()
+        sigreg_target = self.sigreg_loss_fn(target_next_emb)
+        sigreg = 0.5 * (sigreg_pred + sigreg_target)
+
+        pixel_loss = nn.functional.mse_loss(pixel_pred, next_frame)
+        embedding_loss = (
+            1.0 - lambda_sigreg
+        ) * latent_pred_loss + lambda_sigreg * sigreg
+        loss = (1.0 - lambda_pixel) * embedding_loss + lambda_pixel * pixel_loss
+
+        if return_outputs:
+            return loss, {
+                "pred_next_emb": pred_next_emb,
+                "target_next_emb": target_next_emb,
+                "pixel_pred": pixel_pred,
+                "latent_pred_loss": latent_pred_loss.detach(),
+                "sigreg": sigreg.detach(),
+                "sigreg_pred": sigreg_pred.detach(),
+                "sigreg_target": sigreg_target.detach(),
+                "pixel_loss": pixel_loss.detach(),
+            }
+
+        return loss
 
 def train(config: WorldModelConfig, context_len: int = 16):
     print(f"Device: {_DEVICE} | Config: {config.to_dict()}")
@@ -143,7 +181,7 @@ def train(config: WorldModelConfig, context_len: int = 16):
             eval_steps=200,
             save_strategy="steps",
             save_steps=800,
-            logging_dir=f"./checkpoints/logs",
+            logging_dir="./checkpoints/logs",
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
             greater_is_better=False,
@@ -161,19 +199,20 @@ def train(config: WorldModelConfig, context_len: int = 16):
         ),
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        # TODO: add compute_metrics for accuracy
     )
 
     trainer.train()
 
 if __name__ == "__main__":
-    train(WorldModelConfig(
-        height=240,
-        width=320,
-        patch_size=16,
-        dim=384,
-        n_heads=4,
-        n_blocks=8,
-        ffn_mult=3,
-        dropout_proba=0.1,
-    ))
+    train(
+        WorldModelConfig(
+            height=240,
+            width=320,
+            patch_size=16,
+            dim=384,
+            n_heads=4,
+            n_blocks=8,
+            ffn_mult=3,
+            dropout_proba=0.1,
+        )
+    )

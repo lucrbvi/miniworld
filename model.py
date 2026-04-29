@@ -3,7 +3,7 @@ Full implementation of our Latent World Model
 1. Encoder: A single layer CNN
 2. Transformer:
     - Positional Encoding (TODO: try RoPE)
-    - GELU activation function (TODO: try SwiGLU)
+    - GELU activation function (TODO: try SiLU)
 3. Decoder: A simple MLP
 """
 
@@ -217,17 +217,7 @@ class WorldModelConfig(PretrainedConfig):
         self.dropout_proba = dropout_proba
         super().__init__(**kwargs)
 
-class ActionEmbedding(nn.Module):
-    def __init__(self, action_dim: int, model_dim: int):
-        super().__init__()
-        self.proj = nn.Linear(action_dim, model_dim)
-
-    def forward(self, action: Tensor) -> Tensor:
-        return self.proj(action.float()).unsqueeze(1)  # (B, action_dim) -> (B, 1, model_dim)
-
 class WorldModel(PreTrainedModel):
-    config_class = WorldModelConfig
-
     def __init__(self, config: WorldModelConfig):
         super().__init__(config)
         mh_config = {
@@ -255,8 +245,7 @@ class WorldModel(PreTrainedModel):
             }
         )
 
-        self.action_embedding = ActionEmbedding(action_dim=9, model_dim=config.dim)
-
+        self.action_embedding = nn.Linear(9, config.dim)
         self.cls_token = nn.Parameter(torch.randn(1, 1, config.dim))
 
     def forward(self, x: Tensor, action: Tensor):
@@ -272,13 +261,13 @@ class WorldModel(PreTrainedModel):
 
         x = self.encoder(x)
 
-        B_total = x.size(0)
-        cls_tokens = self.cls_token.expand(B_total, -1, -1)
+        B = x.size(0)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
         if is_sequence:
-            action = action.view(B_total, -1)
-        action_tokens = self.action_embedding(action)
+            action = action.view(B, -1)
+        action_tokens = self.action_embedding(action.float()).unsqueeze(1)
 
-        # adding action tokens like this maybe hard to infer dynamics, need to try mixing with frames
+        # adding action tokens like this maybe hard to infer dynamics
         x = torch.cat([cls_tokens, action_tokens, x], dim=1)
         x = self.transformer(x)
 

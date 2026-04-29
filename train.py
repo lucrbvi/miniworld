@@ -16,8 +16,9 @@ from model import WorldModel, WorldModelConfig
 class WMDataset(torch.utils.data.Dataset):
     """Dataset for World Model that stacks M frames and actions as context."""
 
-    def __init__(self, hf_dataset: HFDataset, context_len: int = 16):
+    def __init__(self, hf_dataset: HFDataset, context_len: int = 16, rollout_len: int = 2):
         self.context_len = context_len
+        self.rollout_len = rollout_len
         self.frames = []
         self.actions = []
         self.episodes = []
@@ -34,8 +35,8 @@ class WMDataset(torch.utils.data.Dataset):
 
         self.valid_indices = [
             i
-            for i in range(len(self.frames) - context_len)
-            if self.episodes[i] == self.episodes[i + context_len - 1]
+            for i in range(len(self.frames) - context_len - rollout_len + 1)
+            if self.episodes[i] == self.episodes[i + context_len + rollout_len - 1]
         ]
 
     def __len__(self) -> int:
@@ -45,10 +46,19 @@ class WMDataset(torch.utils.data.Dataset):
         start = self.valid_indices[idx]
         frames = np.stack(self.frames[start : start + self.context_len])
         actions = np.stack(self.actions[start : start + self.context_len])
-        next_frame = self.frames[start + self.context_len]
+        future_start = start + self.context_len
+        future_frames = np.stack(
+            self.frames[future_start : future_start + self.rollout_len]
+        )
+        future_actions = np.stack(
+            self.actions[future_start : future_start + max(self.rollout_len - 1, 0)]
+        )
+        next_frame = future_frames[0]
         return {
             "frames": torch.from_numpy(frames).float() / 255.0,
             "next_frame": torch.from_numpy(next_frame).float() / 255.0,
+            "future_frames": torch.from_numpy(future_frames).float() / 255.0,
+            "future_actions": torch.from_numpy(future_actions).float(),
             "actions": torch.from_numpy(actions).float(),
         }
 
@@ -81,10 +91,17 @@ class WMTrainer(Trainer):
             univariate_test=self.univariate_test, num_slices=1024
         )
 
+    def rollout_step(self, model, latent, action):
+        action_token = model.action_embedding(action.float()).unsqueeze(1)
+        x = torch.cat([latent.unsqueeze(1), action_token], dim=1)
+        return model.transformer(x)[:, 0]
+
     # We are training the world model and the decoder at the same time
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         frames = inputs["frames"]  # [B, M, C, H, W]
         next_frame = inputs["next_frame"]
+        future_frames = inputs["future_frames"]
+        future_actions = inputs["future_actions"]
         actions = inputs["actions"]
 
         B, M, C, H, W = frames.shape
@@ -93,6 +110,7 @@ class WMTrainer(Trainer):
         n_views = 6
         lambda_sigreg = 0.05
         lambda_pixel = 0.1
+        lambda_rollout = 0.25
 
         views = [
             frames
@@ -107,7 +125,7 @@ class WMTrainer(Trainer):
             for _ in range(n_views)
         ]
 
-        x_views = torch.cat(views, dim=0)  # [n_views * B, M, C, H, W]
+        x_views = torch.cat(views, dim=0).contiguous()  # [n_views * B, M, C, H, W]
         actions_views = actions.repeat(n_views, *([1] * (actions.ndim - 1)))
 
         pred_next_emb, pixel_pred = model(x_views, actions_views)
@@ -115,10 +133,23 @@ class WMTrainer(Trainer):
         K = pred_next_emb.shape[-1]
         pred_next_emb = pred_next_emb.view(n_views, B, K)  # [V, B, K]
 
-        target_next_emb = model.encoder(next_frame)
-        target_next_emb = target_next_emb.view(B, K)  # [B, K]
+        with torch.no_grad():
+            target_next_emb = model.encoder(next_frame).mean(dim=1)
+            target_rollout_emb = model.encoder(future_frames[:, 1]).mean(dim=1)
 
         latent_pred_loss = (pred_next_emb - target_next_emb[None]).square().mean()
+
+        rollout_action = future_actions[:, 0].repeat(n_views, 1)
+        rollout_pred = self.rollout_step(
+            model,
+            pred_next_emb.reshape(n_views * B, K),
+            rollout_action,
+        )
+        rollout_pred = rollout_pred.view(n_views, B, K)
+        rollout_loss = nn.functional.l1_loss(
+            rollout_pred,
+            target_rollout_emb[None].expand_as(rollout_pred),
+        )
 
         sigreg_pred = torch.stack(
             [self.sigreg_loss_fn(pred_next_emb[v]) for v in range(n_views)]
@@ -126,11 +157,16 @@ class WMTrainer(Trainer):
         sigreg_target = self.sigreg_loss_fn(target_next_emb)
         sigreg = 0.5 * (sigreg_pred + sigreg_target)
 
-        pixel_loss = nn.functional.mse_loss(pixel_pred, next_frame)
+        pixel_target = next_frame.repeat(n_views, *([1] * (next_frame.ndim - 1)))
+        pixel_loss = nn.functional.mse_loss(pixel_pred, pixel_target)
         embedding_loss = (
             1.0 - lambda_sigreg
         ) * latent_pred_loss + lambda_sigreg * sigreg
-        loss = (1.0 - lambda_pixel) * embedding_loss + lambda_pixel * pixel_loss
+        loss = (
+            (1.0 - lambda_pixel) * embedding_loss
+            + lambda_pixel * pixel_loss
+            + lambda_rollout * rollout_loss
+        )
 
         if return_outputs:
             return loss, {
@@ -138,6 +174,7 @@ class WMTrainer(Trainer):
                 "target_next_emb": target_next_emb,
                 "pixel_pred": pixel_pred,
                 "latent_pred_loss": latent_pred_loss.detach(),
+                "rollout_loss": rollout_loss.detach(),
                 "sigreg": sigreg.detach(),
                 "sigreg_pred": sigreg_pred.detach(),
                 "sigreg_target": sigreg_target.detach(),

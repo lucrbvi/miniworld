@@ -109,10 +109,6 @@ class MHAttention(nn.Module):
             [nn.LayerNorm(self.dim) for _ in range(config["n_blocks"])]
         )
 
-        if _DEVICE == "cuda":
-            k = get_kernel("kernels-community/flash-attn3")
-            self.flash = k.flash_attn_func
-
     def _new_block(self):
         return nn.ModuleDict(
             {
@@ -251,20 +247,19 @@ class WorldModel(PreTrainedModel):
     def forward(self, x: Tensor, action: Tensor):
         # Handle both (B, C, H, W) and (B, M, C, H, W) inputs
         if x.dim() == 5:
-            B, M, C, H, W = x.shape
-            x = x.view(B * M, C, H, W)
+            batch_size, M, C, H, W = x.shape
+            x = x.reshape(batch_size * M, C, H, W)
+            action = action.reshape(batch_size * M, -1)
             is_sequence = True
         else:
-            B = x.size(0)
+            batch_size = x.size(0)
             M = 1
             is_sequence = False
 
         x = self.encoder(x)
 
-        B = x.size(0)
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        if is_sequence:
-            action = action.view(B, -1)
+        token_batch_size = x.size(0)
+        cls_tokens = self.cls_token.expand(token_batch_size, -1, -1)
         action_tokens = self.action_embedding(action.float()).unsqueeze(1)
 
         # adding action tokens like this maybe hard to infer dynamics
@@ -272,11 +267,16 @@ class WorldModel(PreTrainedModel):
         x = self.transformer(x)
 
         patches = x[:, 0, :]
-        decoded = self.decoder(patches)
+        n_patches = (self.config.height // self.config.patch_size) * (
+            self.config.width // self.config.patch_size
+        )
+        decoded = self.decoder(
+            patches.unsqueeze(1).expand(-1, n_patches, -1).contiguous()
+        )
 
         if is_sequence:
-            patches = patches.view(B, M, -1, self.config.dim)
-            decoded = decoded.view(B, M, -1)
+            patches = patches.view(batch_size, M, self.config.dim)[:, -1]
+            decoded = decoded.view(batch_size, M, n_patches, -1)[:, -1]
 
         return patches, fold_patches(
             decoded,

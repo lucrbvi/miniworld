@@ -19,6 +19,7 @@ dependencies = [
   "pillow>=12.1.1",
   "raylib>=5.5.0.4",
   "safetensors>=0.5.0",
+  "scipy>=1.17.1",
   "torch>=2.10.0",
   "tqdm>=4.67.0",
   "transformers>=4.48.0",

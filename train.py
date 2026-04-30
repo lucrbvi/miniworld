@@ -1,4 +1,5 @@
 import lejepa
+import wandb
 import numpy as np
 import torch
 import torch.nn as nn
@@ -9,8 +10,6 @@ from datasets import (
     load_dataset,
 )
 from transformers import Trainer, TrainingArguments
-
-import wandb
 from model import WorldModel, WorldModelConfig
 
 class WMDataset(torch.utils.data.Dataset):
@@ -106,6 +105,7 @@ class WMTrainer(Trainer):
 
         B, M, C, H, W = frames.shape
         device = frames.device
+        self.sigreg_loss_fn = self.sigreg_loss_fn.to(device)
 
         n_views = 6
         lambda_sigreg = 0.05

@@ -70,8 +70,22 @@ def pe(x: Tensor):
     return x + pe_table
 
 # Attention
-def attn(q: Tensor, k: Tensor, v: Tensor, dim: int, mask: Tensor | None = None):
+def attn(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    dim: int,
+    mask: Tensor | None = None,
+    causal: bool = False,
+):
     core = (q @ k.transpose(-2, -1)) / math.sqrt(dim)
+    if causal:
+        seq_len = q.size(-2)
+        causal_mask = torch.triu(
+            torch.full((seq_len, seq_len), -torch.inf, device=q.device),
+            diagonal=1,
+        )
+        core = core + causal_mask
     if mask is not None:
         core = core + mask
     return F.softmax(core, dim=-1) @ v
@@ -86,6 +100,7 @@ class MHAttention(nn.Module):
         self.h_dim = self.dim // self.n_heads
         self.hidden = self.dim * config["ffn_mult"]
         self.bound = 1 / math.sqrt(self.dim)
+        self.causal = config.get("causal", False)
 
         self.blocks = nn.ModuleList(
             [self._new_block() for _ in range(config["n_blocks"])]
@@ -129,7 +144,13 @@ class MHAttention(nn.Module):
                 q = q.half()
                 k = k.half()
                 v = v.half()
-            out = _flash_attn_func(q, k, v, causal=False, return_attn_probs=False)
+            out = _flash_attn_func(
+                q,
+                k,
+                v,
+                causal=self.causal,
+                return_attn_probs=False,
+            )
             # Convert back to original dtype if needed
             if orig_dtype == torch.float32:
                 out = out.float()
@@ -137,7 +158,7 @@ class MHAttention(nn.Module):
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
-            out = attn(q, k, v, self.h_dim).transpose(1, 2)
+            out = attn(q, k, v, self.h_dim, causal=self.causal).transpose(1, 2)
         return out.reshape(B, N, -1)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -173,7 +194,7 @@ class Decoder(nn.Module):
     def forward(self, x: Tensor):
         B, N, D = x.shape
         out = self.model(x.view(B * N, D))
-        return out.view(B, N, -1)
+        return torch.sigmoid(out.view(B, N, -1))
 
 # (B, N, patch_size*patch_size*3) -> (B, 3, H, W)
 def fold_patches(x: Tensor, height: int, width: int, patch_size: int) -> Tensor:
@@ -201,6 +222,7 @@ class WorldModelConfig(PretrainedConfig):
         n_blocks: int = 3,
         ffn_mult: int = 3,
         dropout_proba: float = 0.1,
+        causal: bool = False,
         **kwargs,
     ):
         self.height = height
@@ -211,6 +233,7 @@ class WorldModelConfig(PretrainedConfig):
         self.n_blocks = n_blocks
         self.ffn_mult = ffn_mult
         self.dropout_proba = dropout_proba
+        self.causal = causal
         super().__init__(**kwargs)
 
 class WorldModel(PreTrainedModel):
@@ -222,6 +245,7 @@ class WorldModel(PreTrainedModel):
             "n_blocks": config.n_blocks,
             "ffn_mult": config.ffn_mult,
             "dropout_proba": config.dropout_proba,
+            "causal": config.causal,
         }
         self.encoder = VisionEncoder(
             {
@@ -243,40 +267,30 @@ class WorldModel(PreTrainedModel):
 
         self.action_embedding = nn.Linear(9, config.dim)
         self.cls_token = nn.Parameter(torch.randn(1, 1, config.dim))
+        n_patches = (config.height // config.patch_size) * (
+            config.width // config.patch_size
+        )
+        self.patch_pos_embedding = nn.Parameter(torch.randn(1, n_patches, config.dim))
 
     def forward(self, x: Tensor, action: Tensor):
-        # Handle both (B, C, H, W) and (B, M, C, H, W) inputs
         if x.dim() == 5:
             batch_size, M, C, H, W = x.shape
             x = x.reshape(batch_size * M, C, H, W)
-            action = action.reshape(batch_size * M, -1)
-            is_sequence = True
+            encoded = self.encoder(x).view(batch_size, M, -1, self.config.dim)
+            frame_tokens = encoded.mean(dim=2)
+            action_tokens = self.action_embedding(action.float())
         else:
             batch_size = x.size(0)
-            M = 1
-            is_sequence = False
+            encoded = self.encoder(x)
+            frame_tokens = encoded.mean(dim=1, keepdim=True)
+            action_tokens = self.action_embedding(action.float()).unsqueeze(1)
 
-        x = self.encoder(x)
-
-        token_batch_size = x.size(0)
-        cls_tokens = self.cls_token.expand(token_batch_size, -1, -1)
-        action_tokens = self.action_embedding(action.float()).unsqueeze(1)
-
-        # adding action tokens like this maybe hard to infer dynamics
-        x = torch.cat([cls_tokens, action_tokens, x], dim=1)
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat([frame_tokens + action_tokens, cls_tokens], dim=1)
         x = self.transformer(x)
 
-        patches = x[:, 0, :]
-        n_patches = (self.config.height // self.config.patch_size) * (
-            self.config.width // self.config.patch_size
-        )
-        decoded = self.decoder(
-            patches.unsqueeze(1).expand(-1, n_patches, -1).contiguous()
-        )
-
-        if is_sequence:
-            patches = patches.view(batch_size, M, self.config.dim)[:, -1]
-            decoded = decoded.view(batch_size, M, n_patches, -1)[:, -1]
+        patches = x[:, -1, :]
+        decoded = self.decoder(patches.unsqueeze(1) + self.patch_pos_embedding)
 
         return patches, fold_patches(
             decoded,

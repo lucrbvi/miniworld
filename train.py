@@ -1,46 +1,37 @@
-import lejepa
 import math
-import wandb
+import os
+
+import lejepa
 import numpy as np
 import torch
 import torch.nn.functional as F
 from datasets import Dataset as HFDataset, load_dataset
 from transformers import Trainer, TrainingArguments
+from transformers.trainer_utils import get_last_checkpoint
+
 from model import WorldModel, WorldModelConfig
 
 class WMDataset(torch.utils.data.Dataset):
-    """Dataset for latent world-model prediction, decoding, and rollout."""
+    """Contiguous frame windows for next-latent prediction."""
 
     def __init__(
         self,
         hf_dataset: HFDataset,
-        context_len: int = 16,
-        rollout_len: int = 4,
-        sequence_stride: int | None = None,
+        context_len: int,
+        sequence_stride: int = 1,
         name: str = "dataset",
     ):
-        self.hf_dataset = hf_dataset.select_columns(["frame", "action"])
         self.context_len = context_len
-        self.rollout_len = rollout_len
-        self.sequence_stride = sequence_stride or context_len
+        self.window_len = context_len + 1
+        self.sequence_stride = sequence_stride
+
         print(
             f"Building {name} sequence index from {len(hf_dataset):,} frames...",
             flush=True,
         )
-
-        window_len = context_len + rollout_len
-        if "video_idx" in hf_dataset.column_names:
-            episodes = hf_dataset.select_columns("video_idx").with_format("numpy")[:][
-                "video_idx"
-            ]
-        else:
-            episodes = np.zeros(len(hf_dataset), dtype=np.int64)
-
-        if len(episodes) >= window_len:
-            valid = episodes[: 1 - window_len] == episodes[window_len - 1 :]
-            self.valid_indices = np.flatnonzero(valid)[:: self.sequence_stride].tolist()
-        else:
-            self.valid_indices = []
+        episodes = self._episode_ids(hf_dataset)
+        self.valid_indices = self._valid_window_starts(episodes)
+        self.hf_dataset = hf_dataset.select_columns(["frame", "action"]).with_format("numpy")
 
         print(
             f"Built {name} sequence index: {len(self.valid_indices):,} sequences "
@@ -51,219 +42,178 @@ class WMDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self.valid_indices)
 
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        start = self.valid_indices[idx]
+        samples = self.hf_dataset[start : start + self.window_len]
+        frames = self._frames_to_nchw(samples["frame"])
+        actions = np.asarray(samples["action"])
+
+        return {
+            "frames": torch.from_numpy(frames[: self.context_len]),
+            "target_frame": torch.from_numpy(frames[self.context_len]),
+            "actions": torch.from_numpy(actions[: self.context_len]).float(),
+        }
+
+    def _valid_window_starts(self, episodes: np.ndarray) -> list[int]:
+        if len(episodes) < self.window_len:
+            return []
+
+        same_episode = episodes[: 1 - self.window_len] == episodes[self.window_len - 1 :]
+        return np.flatnonzero(same_episode)[:: self.sequence_stride].tolist()
+
     @staticmethod
-    def _frame_to_chw(frame):
+    def _episode_ids(hf_dataset: HFDataset) -> np.ndarray:
+        if "video_idx" not in hf_dataset.column_names:
+            return np.zeros(len(hf_dataset), dtype=np.int64)
+
+        return hf_dataset.select_columns("video_idx").with_format("numpy")[:]["video_idx"]
+
+    @staticmethod
+    def _frame_to_chw(frame) -> np.ndarray:
         frame = np.asarray(frame)
         if frame.shape[-1] == 3:
             frame = np.transpose(frame, (2, 0, 1))
         return frame
 
-    def __getitem__(self, idx):
-        start = self.valid_indices[idx]
-        end = start + self.context_len + self.rollout_len
-        samples = self.hf_dataset[start:end]
-
-        all_frames = [self._frame_to_chw(frame) for frame in samples["frame"]]
-        all_actions = [np.asarray(action) for action in samples["action"]]
-
-        frames = np.stack(all_frames[: self.context_len])
-        actions = np.stack(all_actions[: self.context_len])
-        future_offset = self.context_len
-        future_frames = np.stack(
-            all_frames[future_offset : future_offset + self.rollout_len]
-        )
-        if self.rollout_len > 1:
-            future_actions = np.stack(
-                all_actions[future_offset : future_offset + self.rollout_len - 1]
-            )
-        else:
-            future_actions = np.zeros((0, *actions.shape[1:]), dtype=actions.dtype)
-
-        return {
-            "frames": torch.from_numpy(frames).float() / 255.0,
-            "future_frames": torch.from_numpy(future_frames).float() / 255.0,
-            "future_actions": torch.from_numpy(future_actions).float(),
-            "actions": torch.from_numpy(actions).float(),
-        }
-
-_DEVICE = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "mps"
-    if torch.mps.is_available()
-    else "cpu"
-)
+    @staticmethod
+    def _frames_to_nchw(frames) -> np.ndarray:
+        frames = np.asarray(frames)
+        if frames.dtype == object:
+            return np.stack([WMDataset._frame_to_chw(frame) for frame in frames])
+        if frames.shape[-1] == 3:
+            return np.transpose(frames, (0, 3, 1, 2))
+        return frames
 
 class WMTrainer(Trainer):
-    def __init__(self, *args, **kwargs):
+    """LeJEPA training: next-latent prediction plus SIGReg only."""
+
+    def __init__(
+        self,
+        *args,
+        sigreg_weight: float = 0.1,
+        recon_weight: float = 0.05,
+        decode_teacher_steps: int = 500,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
-        self.univariate_test = lejepa.univariate.EppsPulley(n_points=17)
-        self.sigreg_loss_fn = lejepa.multivariate.SlicingUnivariateTest(
-            univariate_test=self.univariate_test, num_slices=1024
+        self.sigreg_weight = sigreg_weight
+        self.recon_weight = recon_weight
+        self.decode_teacher_steps = decode_teacher_steps
+        self.sigreg = lejepa.multivariate.SlicingUnivariateTest(
+            univariate_test=lejepa.univariate.EppsPulley(n_points=17),
+            num_slices=1024,
         )
         self._sigreg_device = None
 
     @staticmethod
-    def _scalar(value):
-        if torch.is_tensor(value):
-            return value.detach().float().cpu().item()
-        return float(value)
+    def scalar(value: torch.Tensor) -> float:
+        return value.detach().float().cpu().item()
 
-    def prediction_step(
-        self,
-        model,
-        inputs,
-        prediction_loss_only,
-        ignore_keys=None,
-    ):
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad(), self.compute_loss_context_manager():
             loss = self.compute_loss(model, inputs)
         return loss.detach().mean(), None, None
 
-    def rollout_latents(self, model, context_emb, actions, future_actions, horizon):
-        preds = []
-        rollout_context = context_emb
-
-        for step in range(horizon):
-            if step == 0:
-                rollout_actions = actions
-            else:
-                rollout_actions = torch.cat(
-                    [actions[:, step:], future_actions[:, :step]],
-                    dim=1,
-                )
-
-            pred = model.predict_latent(rollout_context, rollout_actions)
-            preds.append(pred)
-            rollout_context = torch.cat(
-                [rollout_context[:, 1:], pred.detach().unsqueeze(1)],
-                dim=1,
-            )
-
-        return torch.stack(preds, dim=1)
-
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        frames = inputs["frames"]  # [B, M, C, H, W]
-        future_frames = inputs["future_frames"]  # [B, R, C, H, W]
-        future_actions = inputs["future_actions"]  # [B, R - 1, A]
+        frames = inputs["frames"].float() / 255.0
+        target_frame_raw = inputs["target_frame"].float() / 255.0
+        target_frame = target_frame_raw.unsqueeze(1)
         actions = inputs["actions"]
 
-        device = frames.device
-        if self._sigreg_device != device:
-            self.sigreg_loss_fn = self.sigreg_loss_fn.to(device)
-            self._sigreg_device = device
-
-        lambda_sigreg = 0.1
-        lambda_decoder = 1.0
-        max_lambda_rollout = 0.25
-        rollout_warmup_steps = 500
-        rollout_weight = max_lambda_rollout * min(
-            1.0,
-            self.state.global_step / rollout_warmup_steps,
-        )
+        if self._sigreg_device != frames.device:
+            self.sigreg = self.sigreg.to(frames.device)
+            self._sigreg_device = frames.device
 
         context_emb = model.encode_sequence(frames)
-        target_future_emb = model.encode_sequence(future_frames)
-        target_next_emb = target_future_emb[:, 0]
+        target_emb = model.encode_sequence(target_frame).squeeze(1)
+        pred_all = model.predict_latent(context_emb, actions)
+        pred_emb = pred_all[:, -model.n_patches :]
 
-        pred_next_emb = model.predict_latent(context_emb, actions)
+        context_z = model.project_latent(context_emb)
+        target_z = model.project_latent(target_emb)
+        pred_z = model.project_prediction(pred_emb)
 
-        rollout_pred_emb = self.rollout_latents(
-            model,
-            context_emb.detach(),
-            actions,
-            future_actions,
-            horizon=future_frames.size(1),
+        all_z = torch.cat([context_z, target_z.unsqueeze(1)], dim=1)
+        pred_loss = F.mse_loss(pred_z, target_z)
+        sigreg_loss = self.sigreg(all_z.flatten(0, 2))
+
+        teacher_ratio = max(
+            0.0,
+            1.0 - (self.state.global_step / max(1, self.decode_teacher_steps)),
         )
-
-        pred_loss = (pred_next_emb - target_next_emb).square().mean()
-        encoder_emb = torch.cat(
-            [context_emb.flatten(0, 1), target_future_emb.flatten(0, 1)],
-            dim=0,
+        decode_tokens = pred_all.clone()
+        decode_tokens[:, -model.n_patches :] = (
+            teacher_ratio * target_emb.detach() + (1.0 - teacher_ratio) * pred_emb
         )
-        sigreg = self.sigreg_loss_fn(encoder_emb)
+        decoded_pred = model.decode_latent(decode_tokens)
+        recon_loss = F.mse_loss(decoded_pred, target_frame_raw)
 
-        decoded_next = model.decode_latent(target_next_emb.detach())
-        decoder_loss = F.mse_loss(decoded_next, future_frames[:, 0])
+        loss = pred_loss + self.sigreg_weight * sigreg_loss + self.recon_weight * recon_loss
 
-        if rollout_pred_emb.size(1) > 1:
-            rollout_loss = F.mse_loss(
-                rollout_pred_emb[:, 1:],
-                target_future_emb[:, 1:].detach(),
-            )
-        else:
-            rollout_loss = pred_loss.new_zeros(())
-
-        phase_a_loss = pred_loss + lambda_sigreg * sigreg
-        phase_b_loss = lambda_decoder * decoder_loss
-        phase_c_loss = rollout_weight * rollout_loss
-        loss = phase_a_loss + phase_b_loss + phase_c_loss
-
-        with torch.no_grad():
-            z_std = encoder_emb.std(dim=0)
+        if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
+            flat_z = all_z.flatten(0, 2)
+            z_std = flat_z.std(dim=0)
             self.log(
                 {
-                    "loss_total": self._scalar(loss),
-                    "latent_loss": self._scalar(phase_a_loss),
-                    "pred_loss": self._scalar(pred_loss),
-                    "sigreg": self._scalar(sigreg),
-                    "decoder_loss": self._scalar(decoder_loss),
-                    "rollout_loss": self._scalar(rollout_loss),
-                    "rollout_weight": self._scalar(rollout_weight),
-                    "z_std_mean": self._scalar(z_std.mean()),
-                    "z_std_min": self._scalar(z_std.min()),
-                    "pred_std": self._scalar(pred_next_emb.std(dim=0).mean()),
-                    "decoded_std": self._scalar(decoded_next.std(dim=(0, 2, 3)).mean()),
+                    "loss_total": self.scalar(loss),
+                    "pred_loss": self.scalar(pred_loss),
+                    "sigreg": self.scalar(sigreg_loss),
+                    "recon_loss": self.scalar(recon_loss),
+                    "z_std_mean": self.scalar(z_std.mean()),
+                    "z_std_min": self.scalar(z_std.min()),
+                    "z_norm_mean": self.scalar(flat_z.norm(dim=-1).mean()),
+                    "pred_std": self.scalar(pred_z.std(dim=0).mean()),
+                    "target_std": self.scalar(target_z.std(dim=0).mean()),
+                    "decode_teacher_ratio": teacher_ratio,
                 }
             )
 
         if return_outputs:
             return loss, {
-                "pred_next_emb": pred_next_emb,
-                "target_next_emb": target_next_emb,
-                "pred_loss": pred_loss.detach(),
-                "sigreg": sigreg.detach(),
-                "decoder_loss": decoder_loss.detach(),
-                "rollout_loss": rollout_loss.detach(),
+                "pred_emb": pred_z.detach(),
+                "target_emb": target_z.detach(),
             }
-
         return loss
+
+def device_name() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 def train(
     config: WorldModelConfig,
     context_len: int = 16,
-    rollout_len: int = 4,
-    sequence_stride: int | None = 1,
+    sequence_stride: int = 1,
     max_eval_sequences: int = 2048,
 ):
-    if _DEVICE == "cuda":
+    device = device_name()
+    if device == "cuda":
         torch.set_float32_matmul_precision("high")
 
-    print(f"Device: {_DEVICE} | Config: {config.to_dict()}", flush=True)
-
+    print(f"Device: {device} | Config: {config.to_dict()}", flush=True)
     print("Loading dataset...", flush=True)
     ds = load_dataset("lucrbrtv/doom-e1-internet-gameplay", split="train")
     print(f"Loaded dataset: {len(ds):,} frames", flush=True)
 
     print("Splitting train/eval...", flush=True)
-    ds = ds.train_test_split(test_size=0.1, shuffle=False)
+    split = ds.train_test_split(test_size=0.1, shuffle=False)
     print(
-        f"Split sizes: train={len(ds['train']):,} | eval={len(ds['test']):,}",
+        f"Split sizes: train={len(split['train']):,} | eval={len(split['test']):,}",
         flush=True,
     )
 
     train_dataset = WMDataset(
-        ds["train"],
+        split["train"],
         context_len=context_len,
-        rollout_len=rollout_len,
         sequence_stride=sequence_stride,
         name="train",
     )
     eval_dataset = WMDataset(
-        ds["test"],
+        split["test"],
         context_len=context_len,
-        rollout_len=rollout_len,
         sequence_stride=sequence_stride,
         name="eval",
     )
@@ -277,80 +227,70 @@ def train(
         flush=True,
     )
 
+    os.environ.setdefault("WANDB_PROJECT", "miniworld-wm")
+
     model = WorldModel(config)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}", flush=True)
 
-    print("Initializing wandb...", flush=True)
-    wandb.init(project="miniworld-wm")
-
-    training_args = TrainingArguments(
-        max_steps=1000,
+    args = TrainingArguments(
         output_dir="./checkpoints",
-        num_train_epochs=60,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
-        learning_rate=3e-5,
+        max_steps=2000,
+        per_device_train_batch_size=4,
+        per_device_eval_batch_size=4,
+        gradient_accumulation_steps=1,
+        learning_rate=5e-5,
         warmup_steps=100,
-        weight_decay=0.05,
-        logging_steps=1,
+        weight_decay=1e-3,
+        max_grad_norm=1.0,
+        bf16=device == "cuda",
+        logging_steps=5,
         logging_first_step=True,
         eval_strategy="steps",
-        eval_steps=200,
+        eval_steps=500,
         save_strategy="steps",
-        save_steps=200,
-        save_total_limit=3,
-        logging_dir="./checkpoints/logs",
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        max_grad_norm=1.0,
-        bf16=_DEVICE == "cuda",
-        gradient_accumulation_steps=4,
-        dataloader_num_workers=8,
-        dataloader_prefetch_factor=4,
+        save_steps=500,
+        load_best_model_at_end=False,
+        dataloader_num_workers=4,
+        dataloader_prefetch_factor=1,
         dataloader_pin_memory=True,
         dataloader_persistent_workers=True,
         remove_unused_columns=False,
         report_to=["wandb"],
-        push_to_hub=True,
-        hub_model_id="doom-world-model",
         torch_compile=True,
     )
 
-    train_batches_per_epoch = math.ceil(
-        len(train_dataset) / training_args.per_device_train_batch_size
-    )
     steps_per_epoch = math.ceil(
-        train_batches_per_epoch / training_args.gradient_accumulation_steps
+        math.ceil(len(train_dataset) / args.per_device_train_batch_size)
+        / args.gradient_accumulation_steps
     )
-    total_steps = (
-        training_args.max_steps
-        if training_args.max_steps > 0
-        else steps_per_epoch * math.ceil(training_args.num_train_epochs)
-    )
-    eval_batches = math.ceil(len(eval_dataset) / training_args.per_device_eval_batch_size)
+    eval_batches = math.ceil(len(eval_dataset) / args.per_device_eval_batch_size)
     print(
         "Training plan: "
         f"{steps_per_epoch:,} steps/epoch | "
-        f"{total_steps:,} total steps | "
-        f"{total_steps // training_args.eval_steps:,} evals "
-        f"({eval_batches:,} batches/eval) | "
-        f"{total_steps // training_args.save_steps:,} saves",
+        f"{args.max_steps:,} total steps | "
+        f"{args.max_steps // args.eval_steps:,} evals ({eval_batches:,} batches/eval) | "
+        f"{args.max_steps // args.save_steps:,} saves",
         flush=True,
     )
-    print("Starting training...", flush=True)
 
     trainer = WMTrainer(
         model=model,
-        args=training_args,
+        args=args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        sigreg_weight=0.1,
+        recon_weight=0.05,
     )
 
-    trainer.train()
+    last_checkpoint = get_last_checkpoint(args.output_dir)
+    if last_checkpoint is not None:
+        print(f"Resuming from checkpoint: {last_checkpoint}", flush=True)
+    trainer.train(resume_from_checkpoint=last_checkpoint)
 
 if __name__ == "__main__":
     train(
+        context_len=10,
+        config=
         WorldModelConfig(
             height=240,
             width=320,
@@ -361,5 +301,5 @@ if __name__ == "__main__":
             ffn_mult=3,
             dropout_proba=0.1,
             causal=True,
-        )
+        ),
     )

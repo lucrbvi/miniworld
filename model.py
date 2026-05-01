@@ -180,21 +180,53 @@ class MHAttention(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, config: dict):
         super().__init__()
-        self.dim = config["dim"]
-        patch_dim = config["patch_size"] * config["patch_size"] * 3
+        dim = config["dim"]
+        self.patch_size = config["patch_size"]
+        self.grid_h = config["height"] // self.patch_size
+        self.grid_w = config["width"] // self.patch_size
+        n_queries = self.grid_h * self.grid_w
+        patch_dim = self.patch_size * self.patch_size * 3
 
-        self.model = nn.Sequential(
-            nn.Linear(self.dim, self.dim * 5),
+        # Learnable spatial queries (one per output patch)
+        self.queries = nn.Parameter(torch.randn(n_queries, dim))
+
+        self.cross = nn.MultiheadAttention(dim, num_heads=4, batch_first=True)
+        self.norm = nn.LayerNorm(dim)
+
+        self.to_patch = nn.Sequential(
+            nn.Linear(dim, dim),
             nn.GELU(),
-            nn.Linear(self.dim * 5, self.dim * 5),
-            nn.GELU(),
-            nn.Linear(self.dim * 5, patch_dim),
+            nn.Linear(dim, patch_dim),
         )
 
-    def forward(self, x: Tensor):
-        B, N, D = x.shape
-        out = self.model(x.view(B * N, D))
-        return torch.sigmoid(out.view(B, N, -1))
+    def forward(self, x: Tensor) -> Tensor:
+        B = x.size(0)
+        q = self.queries.unsqueeze(0).expand(B, -1, -1) # (B, N_queries, D)
+        out, _ = self.cross(q, x, x)
+        out = self.norm(out + q)
+        patches = torch.sigmoid(self.to_patch(out)) # (B, N_queries, patch_dim)
+        return fold_patches(
+            patches,
+            self.grid_h * self.patch_size,
+            self.grid_w * self.patch_size,
+            self.patch_size,
+        )
+
+class Projector(nn.Module):
+    """Small projection head used to stabilize training"""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.BatchNorm1d(dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        shape = x.shape
+        return self.model(x.reshape(-1, shape[-1])).view(shape)
 
 # (B, N, patch_size*patch_size*3) -> (B, 3, H, W)
 def fold_patches(x: Tensor, height: int, width: int, patch_size: int) -> Tensor:
@@ -266,36 +298,40 @@ class WorldModel(PreTrainedModel):
         )
 
         self.action_embedding = nn.Linear(9, config.dim)
+        self.encoder_projector = Projector(config.dim)
+        self.predictor_projector = Projector(config.dim)
         self.cls_token = nn.Parameter(torch.randn(1, 1, config.dim))
-        n_patches = (config.height // config.patch_size) * (
-            config.width // config.patch_size
+        self.prediction_queries = nn.Parameter(
+            torch.randn(
+                (config.height // config.patch_size) * (config.width // config.patch_size),
+                config.dim,
+            )
         )
-        self.patch_pos_embedding = nn.Parameter(torch.randn(1, n_patches, config.dim))
 
-    def encode_frame(self, frame: Tensor) -> Tensor:
-        return self.encoder(frame).mean(dim=1)
+    @property
+    def n_patches(self) -> int:
+        return (self.config.height // self.config.patch_size) * (
+            self.config.width // self.config.patch_size
+        )
+
 
     def encode_sequence(self, frames: Tensor) -> Tensor:
         batch_size, seq_len, C, H, W = frames.shape
         flat_frames = frames.reshape(batch_size * seq_len, C, H, W)
-        latents = self.encode_frame(flat_frames)
-        return latents.view(batch_size, seq_len, self.config.dim)
+        latents = self.encoder(flat_frames)
+        return latents.view(batch_size, seq_len, self.n_patches, self.config.dim)
 
     def predict_latent(self, latents: Tensor, actions: Tensor) -> Tensor:
         batch_size = latents.size(0)
-        action_tokens = self.action_embedding(actions.float())
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        x = torch.cat([latents + action_tokens, cls_tokens], dim=1)
-        return self.transformer(x)[:, -1]
-
-    def decode_latent(self, latent: Tensor) -> Tensor:
-        decoded = self.decoder(latent.unsqueeze(1) + self.patch_pos_embedding)
-        return fold_patches(
-            decoded,
-            self.config.height,
-            self.config.width,
-            self.config.patch_size,
+        _, seq_len, n_patches, dim = latents.shape
+        action_tokens = self.action_embedding(actions.float()).unsqueeze(2)
+        context_tokens = (latents + action_tokens).reshape(
+            batch_size, seq_len * n_patches, dim
         )
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        pred_queries = self.prediction_queries.unsqueeze(0).expand(batch_size, -1, -1)
+        x = torch.cat([context_tokens, cls_tokens, pred_queries], dim=1)
+        return self.transformer(x)
 
     def forward(self, frames: Tensor, actions: Tensor, decode: bool = True):
         if frames.dim() == 4:
@@ -307,4 +343,4 @@ class WorldModel(PreTrainedModel):
         if not decode:
             return pred_next_latent, None
 
-        return pred_next_latent, self.decode_latent(pred_next_latent)
+        return pred_next_latent, self.decoder(pred_next_latent)

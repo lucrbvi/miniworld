@@ -3,19 +3,19 @@ import math
 import wandb
 import numpy as np
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from datasets import Dataset as HFDataset, load_dataset
 from transformers import Trainer, TrainingArguments
 from model import WorldModel, WorldModelConfig
 
 class WMDataset(torch.utils.data.Dataset):
-    """Dataset for World Model that stacks M frames and actions as context."""
+    """Dataset for latent world-model prediction, decoding, and rollout."""
 
     def __init__(
         self,
         hf_dataset: HFDataset,
         context_len: int = 16,
-        rollout_len: int = 2,
+        rollout_len: int = 4,
         sequence_stride: int | None = None,
         name: str = "dataset",
     ):
@@ -72,13 +72,15 @@ class WMDataset(torch.utils.data.Dataset):
         future_frames = np.stack(
             all_frames[future_offset : future_offset + self.rollout_len]
         )
-        future_actions = np.stack(
-            all_actions[future_offset : future_offset + max(self.rollout_len - 1, 0)]
-        )
-        next_frame = future_frames[0]
+        if self.rollout_len > 1:
+            future_actions = np.stack(
+                all_actions[future_offset : future_offset + self.rollout_len - 1]
+            )
+        else:
+            future_actions = np.zeros((0, *actions.shape[1:]), dtype=actions.dtype)
+
         return {
             "frames": torch.from_numpy(frames).float() / 255.0,
-            "next_frame": torch.from_numpy(next_frame).float() / 255.0,
             "future_frames": torch.from_numpy(future_frames).float() / 255.0,
             "future_actions": torch.from_numpy(future_actions).float(),
             "actions": torch.from_numpy(actions).float(),
@@ -92,19 +94,6 @@ _DEVICE = (
     else "cpu"
 )
 
-# Create and apply a binary mask to let n_visible masks visible on multiple frames
-# (it generate a new random mask for each frames)
-def make_mask(B, M, H, W, n_visible, device, patch_size=16):
-    ph, pw = H // patch_size, W // patch_size
-    idx = torch.stack(
-        [torch.randperm(ph * pw, device=device)[:n_visible] for _ in range(B * M)]
-    )
-    mask = torch.zeros(B * M, ph * pw, device=device).scatter_(1, idx, 1.0)
-    mask = mask.view(B, M, ph, pw).unsqueeze(2)
-    return mask.repeat_interleave(patch_size, -2).repeat_interleave(
-        patch_size, -1
-    )  # (B, M, 1, H, W)
-
 class WMTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -112,12 +101,13 @@ class WMTrainer(Trainer):
         self.sigreg_loss_fn = lejepa.multivariate.SlicingUnivariateTest(
             univariate_test=self.univariate_test, num_slices=1024
         )
+        self._sigreg_device = None
 
-    def rollout_step(self, model, latent, action):
-        cls_token = model.cls_token.expand(latent.size(0), -1, -1)
-        action_token = model.action_embedding(action.float()).unsqueeze(1)
-        x = torch.cat([latent.unsqueeze(1) + action_token, cls_token], dim=1)
-        return model.transformer(x)[:, -1]
+    @staticmethod
+    def _scalar(value):
+        if torch.is_tensor(value):
+            return value.detach().float().cpu().item()
+        return float(value)
 
     def prediction_step(
         self,
@@ -131,98 +121,111 @@ class WMTrainer(Trainer):
             loss = self.compute_loss(model, inputs)
         return loss.detach().mean(), None, None
 
-    # We are training the world model and the decoder at the same time
+    def rollout_latents(self, model, context_emb, actions, future_actions, horizon):
+        preds = []
+        rollout_context = context_emb
+
+        for step in range(horizon):
+            if step == 0:
+                rollout_actions = actions
+            else:
+                rollout_actions = torch.cat(
+                    [actions[:, step:], future_actions[:, :step]],
+                    dim=1,
+                )
+
+            pred = model.predict_latent(rollout_context, rollout_actions)
+            preds.append(pred)
+            rollout_context = torch.cat(
+                [rollout_context[:, 1:], pred.detach().unsqueeze(1)],
+                dim=1,
+            )
+
+        return torch.stack(preds, dim=1)
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         frames = inputs["frames"]  # [B, M, C, H, W]
-        next_frame = inputs["next_frame"]
-        future_frames = inputs["future_frames"]
-        future_actions = inputs["future_actions"]
+        future_frames = inputs["future_frames"]  # [B, R, C, H, W]
+        future_actions = inputs["future_actions"]  # [B, R - 1, A]
         actions = inputs["actions"]
 
-        B, M, C, H, W = frames.shape
         device = frames.device
-        self.sigreg_loss_fn = self.sigreg_loss_fn.to(device)
+        if self._sigreg_device != device:
+            self.sigreg_loss_fn = self.sigreg_loss_fn.to(device)
+            self._sigreg_device = device
 
-        n_views = 3 # 6 by default, but is slowing training down
-        lambda_sigreg = 0.05
-        lambda_pixel = 0.5
-        lambda_masked = 0.25
-        lambda_rollout = 0.25
+        lambda_sigreg = 0.1
+        lambda_decoder = 1.0
+        max_lambda_rollout = 0.25
+        rollout_warmup_steps = 500
+        rollout_weight = max_lambda_rollout * min(
+            1.0,
+            self.state.global_step / rollout_warmup_steps,
+        )
 
-        pred_next_emb, pixel_pred = model(frames, actions)
+        context_emb = model.encode_sequence(frames)
+        target_future_emb = model.encode_sequence(future_frames)
+        target_next_emb = target_future_emb[:, 0]
 
-        views = [
-            frames
-            * make_mask(
-                B,
-                M,
-                H,
-                W,
-                n_visible=6,
-                device=device,
-            )
-            for _ in range(n_views)
-        ]
+        pred_next_emb = model.predict_latent(context_emb, actions)
 
-        x_views = torch.cat(views, dim=0).contiguous()  # [n_views * B, M, C, H, W]
-        actions_views = actions.repeat(n_views, *([1] * (actions.ndim - 1)))
-        masked_pred_next_emb, _ = model(x_views, actions_views)
-
-        K = masked_pred_next_emb.shape[-1]
-        masked_pred_next_emb = masked_pred_next_emb.view(n_views, B, K)  # [V, B, K]
-
-        target_next_emb = model.encoder(next_frame).mean(dim=1)
-        target_rollout_emb = model.encoder(future_frames[:, 1]).mean(dim=1)
-
-        latent_pred_loss = (pred_next_emb - target_next_emb).square().mean()
-        masked_latent_pred_loss = (
-            masked_pred_next_emb - target_next_emb[None]
-        ).square().mean()
-
-        rollout_action = future_actions[:, 0]
-        rollout_pred = self.rollout_step(
+        rollout_pred_emb = self.rollout_latents(
             model,
-            pred_next_emb,
-            rollout_action,
-        )
-        rollout_loss = nn.functional.l1_loss(
-            rollout_pred,
-            target_rollout_emb,
+            context_emb.detach(),
+            actions,
+            future_actions,
+            horizon=future_frames.size(1),
         )
 
-        sigreg_pred = 0.5 * (
-            self.sigreg_loss_fn(pred_next_emb)
-            + torch.stack(
-                [self.sigreg_loss_fn(masked_pred_next_emb[v]) for v in range(n_views)]
-            ).mean()
+        pred_loss = (pred_next_emb - target_next_emb).square().mean()
+        encoder_emb = torch.cat(
+            [context_emb.flatten(0, 1), target_future_emb.flatten(0, 1)],
+            dim=0,
         )
-        sigreg_target = self.sigreg_loss_fn(target_next_emb)
-        sigreg = 0.5 * (sigreg_pred + sigreg_target)
+        sigreg = self.sigreg_loss_fn(encoder_emb)
 
-        pixel_loss = nn.functional.mse_loss(pixel_pred, next_frame)
-        embedding_loss = (
-            1.0 - lambda_sigreg
-        ) * (
-            latent_pred_loss + lambda_masked * masked_latent_pred_loss
-        ) + lambda_sigreg * sigreg
-        loss = (
-            (1.0 - lambda_pixel) * embedding_loss
-            + lambda_pixel * pixel_loss
-            + lambda_rollout * rollout_loss
-        )
+        decoded_next = model.decode_latent(target_next_emb.detach())
+        decoder_loss = F.mse_loss(decoded_next, future_frames[:, 0])
+
+        if rollout_pred_emb.size(1) > 1:
+            rollout_loss = F.mse_loss(
+                rollout_pred_emb[:, 1:],
+                target_future_emb[:, 1:].detach(),
+            )
+        else:
+            rollout_loss = pred_loss.new_zeros(())
+
+        phase_a_loss = pred_loss + lambda_sigreg * sigreg
+        phase_b_loss = lambda_decoder * decoder_loss
+        phase_c_loss = rollout_weight * rollout_loss
+        loss = phase_a_loss + phase_b_loss + phase_c_loss
+
+        with torch.no_grad():
+            z_std = encoder_emb.std(dim=0)
+            self.log(
+                {
+                    "loss_total": self._scalar(loss),
+                    "latent_loss": self._scalar(phase_a_loss),
+                    "pred_loss": self._scalar(pred_loss),
+                    "sigreg": self._scalar(sigreg),
+                    "decoder_loss": self._scalar(decoder_loss),
+                    "rollout_loss": self._scalar(rollout_loss),
+                    "rollout_weight": self._scalar(rollout_weight),
+                    "z_std_mean": self._scalar(z_std.mean()),
+                    "z_std_min": self._scalar(z_std.min()),
+                    "pred_std": self._scalar(pred_next_emb.std(dim=0).mean()),
+                    "decoded_std": self._scalar(decoded_next.std(dim=(0, 2, 3)).mean()),
+                }
+            )
 
         if return_outputs:
             return loss, {
                 "pred_next_emb": pred_next_emb,
                 "target_next_emb": target_next_emb,
-                "pixel_pred": pixel_pred,
-                "latent_pred_loss": latent_pred_loss.detach(),
-                "masked_latent_pred_loss": masked_latent_pred_loss.detach(),
-                "rollout_loss": rollout_loss.detach(),
+                "pred_loss": pred_loss.detach(),
                 "sigreg": sigreg.detach(),
-                "sigreg_pred": sigreg_pred.detach(),
-                "sigreg_target": sigreg_target.detach(),
-                "pixel_loss": pixel_loss.detach(),
+                "decoder_loss": decoder_loss.detach(),
+                "rollout_loss": rollout_loss.detach(),
             }
 
         return loss
@@ -230,9 +233,13 @@ class WMTrainer(Trainer):
 def train(
     config: WorldModelConfig,
     context_len: int = 16,
-    sequence_stride: int | None = None,
+    rollout_len: int = 4,
+    sequence_stride: int | None = 1,
     max_eval_sequences: int = 2048,
 ):
+    if _DEVICE == "cuda":
+        torch.set_float32_matmul_precision("high")
+
     print(f"Device: {_DEVICE} | Config: {config.to_dict()}", flush=True)
 
     print("Loading dataset...", flush=True)
@@ -249,12 +256,14 @@ def train(
     train_dataset = WMDataset(
         ds["train"],
         context_len=context_len,
+        rollout_len=rollout_len,
         sequence_stride=sequence_stride,
         name="train",
     )
     eval_dataset = WMDataset(
         ds["test"],
         context_len=context_len,
+        rollout_len=rollout_len,
         sequence_stride=sequence_stride,
         name="eval",
     )
@@ -283,7 +292,7 @@ def train(
         learning_rate=3e-5,
         warmup_steps=100,
         weight_decay=0.05,
-        logging_steps=20,
+        logging_steps=1,
         logging_first_step=True,
         eval_strategy="steps",
         eval_steps=200,
@@ -305,6 +314,7 @@ def train(
         report_to=["wandb"],
         push_to_hub=True,
         hub_model_id="doom-world-model",
+        torch_compile=True,
     )
 
     train_batches_per_epoch = math.ceil(

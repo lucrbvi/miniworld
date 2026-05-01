@@ -272,29 +272,39 @@ class WorldModel(PreTrainedModel):
         )
         self.patch_pos_embedding = nn.Parameter(torch.randn(1, n_patches, config.dim))
 
-    def forward(self, x: Tensor, action: Tensor):
-        if x.dim() == 5:
-            batch_size, M, C, H, W = x.shape
-            x = x.reshape(batch_size * M, C, H, W)
-            encoded = self.encoder(x).view(batch_size, M, -1, self.config.dim)
-            frame_tokens = encoded.mean(dim=2)
-            action_tokens = self.action_embedding(action.float())
-        else:
-            batch_size = x.size(0)
-            encoded = self.encoder(x)
-            frame_tokens = encoded.mean(dim=1, keepdim=True)
-            action_tokens = self.action_embedding(action.float()).unsqueeze(1)
+    def encode_frame(self, frame: Tensor) -> Tensor:
+        return self.encoder(frame).mean(dim=1)
 
+    def encode_sequence(self, frames: Tensor) -> Tensor:
+        batch_size, seq_len, C, H, W = frames.shape
+        flat_frames = frames.reshape(batch_size * seq_len, C, H, W)
+        latents = self.encode_frame(flat_frames)
+        return latents.view(batch_size, seq_len, self.config.dim)
+
+    def predict_latent(self, latents: Tensor, actions: Tensor) -> Tensor:
+        batch_size = latents.size(0)
+        action_tokens = self.action_embedding(actions.float())
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        x = torch.cat([frame_tokens + action_tokens, cls_tokens], dim=1)
-        x = self.transformer(x)
+        x = torch.cat([latents + action_tokens, cls_tokens], dim=1)
+        return self.transformer(x)[:, -1]
 
-        patches = x[:, -1, :]
-        decoded = self.decoder(patches.unsqueeze(1) + self.patch_pos_embedding)
-
-        return patches, fold_patches(
+    def decode_latent(self, latent: Tensor) -> Tensor:
+        decoded = self.decoder(latent.unsqueeze(1) + self.patch_pos_embedding)
+        return fold_patches(
             decoded,
             self.config.height,
             self.config.width,
             self.config.patch_size,
         )
+
+    def forward(self, frames: Tensor, actions: Tensor, decode: bool = True):
+        if frames.dim() == 4:
+            frames = frames.unsqueeze(1)
+            actions = actions.unsqueeze(1)
+
+        latents = self.encode_sequence(frames)
+        pred_next_latent = self.predict_latent(latents, actions)
+        if not decode:
+            return pred_next_latent, None
+
+        return pred_next_latent, self.decode_latent(pred_next_latent)

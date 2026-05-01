@@ -175,10 +175,11 @@ def run(args: argparse.Namespace) -> None:
             now = rl.get_time()
 
             if now - last_step_time >= frame_interval:
-                next_frame = predict_next_frame(model, frames, actions, device)
+                action_context = [*actions[1:], action]
+                next_frame = predict_next_frame(model, frames, action_context, device)
                 frame = tensor_to_frame(next_frame)
                 frames = [*frames[1:], frame_to_tensor(frame, device)]
-                actions = [*actions[1:], action]
+                actions = action_context
                 texture = replace_texture(texture, frame)
                 generated_count += 1
                 last_step_time = now

@@ -296,17 +296,16 @@ class WorldModel(PreTrainedModel):
                 "patch_size": config.patch_size,
             }
         )
-
-        self.action_embedding = nn.Linear(9, config.dim)
         self.encoder_projector = Projector(config.dim)
         self.predictor_projector = Projector(config.dim)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, config.dim))
-        self.prediction_queries = nn.Parameter(
-            torch.randn(
-                (config.height // config.patch_size) * (config.width // config.patch_size),
-                config.dim,
-            )
+        self.state_token = nn.Parameter(torch.randn(1, 1, config.dim) * 0.02)
+        self.state_pooler = nn.MultiheadAttention(
+            config.dim,
+            num_heads=config.n_heads,
+            batch_first=True,
         )
+        self.action_embedding = nn.Linear(9, config.dim)
+        self.pred_token = nn.Parameter(torch.randn(1, 1, config.dim) * 0.02)
 
     @property
     def n_patches(self) -> int:
@@ -314,33 +313,31 @@ class WorldModel(PreTrainedModel):
             self.config.width // self.config.patch_size
         )
 
-
     def encode_sequence(self, frames: Tensor) -> Tensor:
         batch_size, seq_len, C, H, W = frames.shape
         flat_frames = frames.reshape(batch_size * seq_len, C, H, W)
-        latents = self.encoder(flat_frames)
-        return latents.view(batch_size, seq_len, self.n_patches, self.config.dim)
+        patch_latents = self.encoder(flat_frames)
+
+        state_token = self.state_token.expand(batch_size * seq_len, -1, -1)
+        states, _ = self.state_pooler(state_token, patch_latents, patch_latents)
+        states = states.squeeze(1).view(batch_size, seq_len, self.config.dim)
+        return self.encoder_projector(states)
 
     def predict_latent(self, latents: Tensor, actions: Tensor) -> Tensor:
-        batch_size = latents.size(0)
-        _, seq_len, n_patches, dim = latents.shape
-        action_tokens = self.action_embedding(actions.float()).unsqueeze(2)
-        context_tokens = (latents + action_tokens).reshape(
-            batch_size, seq_len * n_patches, dim
-        )
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        pred_queries = self.prediction_queries.unsqueeze(0).expand(batch_size, -1, -1)
-        x = torch.cat([context_tokens, cls_tokens, pred_queries], dim=1)
-        return self.transformer(x)
+        batch_size, seq_len, dim = latents.shape
+        action_tokens = self.action_embedding(actions.float())
+        context_tokens = latents + action_tokens
+        pred_token = self.pred_token.expand(batch_size, -1, -1) + action_tokens[:, -1:]
+        x = torch.cat([context_tokens, pred_token], dim=1)
+        return self.predictor_projector(self.transformer(x)[:, -1])
 
-    def forward(self, frames: Tensor, actions: Tensor, decode: bool = True):
+    def forward(self, frames: Tensor, actions: Tensor, decode: bool = False):
         if frames.dim() == 4:
             frames = frames.unsqueeze(1)
             actions = actions.unsqueeze(1)
 
         latents = self.encode_sequence(frames)
-        pred_next_latent = self.predict_latent(latents, actions)
+        pred_latents = self.predict_latent(latents, actions)
         if not decode:
-            return pred_next_latent, None
-
-        return pred_next_latent, self.decoder(pred_next_latent)
+            return pred_latents
+        return pred_latents, self.decoder(pred_latents.unsqueeze(1))

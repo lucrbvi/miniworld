@@ -85,23 +85,17 @@ class WMDataset(torch.utils.data.Dataset):
         return frames
 
 class WMTrainer(Trainer):
-    """LeJEPA training: next-latent prediction plus SIGReg only."""
-
     def __init__(
         self,
         *args,
         sigreg_weight: float = 0.1,
-        recon_weight: float = 0.05,
-        decode_teacher_steps: int = 500,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.sigreg_weight = sigreg_weight
-        self.recon_weight = recon_weight
-        self.decode_teacher_steps = decode_teacher_steps
         self.sigreg = lejepa.multivariate.SlicingUnivariateTest(
             univariate_test=lejepa.univariate.EppsPulley(n_points=17),
-            num_slices=1024,
+            num_slices=512,
         )
         self._sigreg_device = None
 
@@ -117,55 +111,39 @@ class WMTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         frames = inputs["frames"].float() / 255.0
-        target_frame_raw = inputs["target_frame"].float() / 255.0
-        target_frame = target_frame_raw.unsqueeze(1)
+        target_frame = (inputs["target_frame"].float() / 255.0).unsqueeze(1)
         actions = inputs["actions"]
 
         if self._sigreg_device != frames.device:
             self.sigreg = self.sigreg.to(frames.device)
             self._sigreg_device = frames.device
 
-        context_emb = model.encode_sequence(frames)
-        target_emb = model.encode_sequence(target_frame).squeeze(1)
-        pred_all = model.predict_latent(context_emb, actions)
-        pred_emb = pred_all[:, -model.n_patches :]
+        context_z = model.encode_sequence(frames)
+        target_z = model.encode_sequence(target_frame).squeeze(1)
+        pred_z = model.predict_latent(context_z, actions)
 
-        context_z = model.project_latent(context_emb)
-        target_z = model.project_latent(target_emb)
-        pred_z = model.project_prediction(pred_emb)
-
-        all_z = torch.cat([context_z, target_z.unsqueeze(1)], dim=1)
+        sigreg_z = torch.cat(
+            [context_z.flatten(0, 1), target_z],
+            dim=0,
+        )
+        sigreg_loss = self.sigreg(sigreg_z)
         pred_loss = F.mse_loss(pred_z, target_z)
-        sigreg_loss = self.sigreg(all_z.flatten(0, 2))
 
-        teacher_ratio = max(
-            0.0,
-            1.0 - (self.state.global_step / max(1, self.decode_teacher_steps)),
-        )
-        decode_tokens = pred_all.clone()
-        decode_tokens[:, -model.n_patches :] = (
-            teacher_ratio * target_emb.detach() + (1.0 - teacher_ratio) * pred_emb
-        )
-        decoded_pred = model.decode_latent(decode_tokens)
-        recon_loss = F.mse_loss(decoded_pred, target_frame_raw)
-
-        loss = pred_loss + self.sigreg_weight * sigreg_loss + self.recon_weight * recon_loss
+        loss = pred_loss + self.sigreg_weight * sigreg_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
-            flat_z = all_z.flatten(0, 2)
+            flat_z = sigreg_z
             z_std = flat_z.std(dim=0)
             self.log(
                 {
                     "loss_total": self.scalar(loss),
                     "pred_loss": self.scalar(pred_loss),
                     "sigreg": self.scalar(sigreg_loss),
-                    "recon_loss": self.scalar(recon_loss),
                     "z_std_mean": self.scalar(z_std.mean()),
                     "z_std_min": self.scalar(z_std.min()),
                     "z_norm_mean": self.scalar(flat_z.norm(dim=-1).mean()),
                     "pred_std": self.scalar(pred_z.std(dim=0).mean()),
                     "target_std": self.scalar(target_z.std(dim=0).mean()),
-                    "decode_teacher_ratio": teacher_ratio,
                 }
             )
 
@@ -234,21 +212,22 @@ def train(
 
     args = TrainingArguments(
         output_dir="./checkpoints",
-        max_steps=2000,
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=4,
+        num_train_epochs=1,
+        max_steps=-1,
+        per_device_train_batch_size=128,
+        per_device_eval_batch_size=128,
         gradient_accumulation_steps=1,
         learning_rate=5e-5,
-        warmup_steps=100,
+        warmup_steps=0,
         weight_decay=1e-3,
         max_grad_norm=1.0,
         bf16=device == "cuda",
         logging_steps=5,
-        logging_first_step=True,
+        logging_first_step=False,
         eval_strategy="steps",
-        eval_steps=500,
+        eval_steps=1000,
         save_strategy="steps",
-        save_steps=500,
+        save_steps=1000,
         load_best_model_at_end=False,
         dataloader_num_workers=4,
         dataloader_prefetch_factor=1,
@@ -263,13 +242,15 @@ def train(
         math.ceil(len(train_dataset) / args.per_device_train_batch_size)
         / args.gradient_accumulation_steps
     )
+    total_steps = math.ceil(steps_per_epoch * args.num_train_epochs)
     eval_batches = math.ceil(len(eval_dataset) / args.per_device_eval_batch_size)
     print(
         "Training plan: "
         f"{steps_per_epoch:,} steps/epoch | "
-        f"{args.max_steps:,} total steps | "
-        f"{args.max_steps // args.eval_steps:,} evals ({eval_batches:,} batches/eval) | "
-        f"{args.max_steps // args.save_steps:,} saves",
+        f"{args.num_train_epochs:g} epoch(s) | "
+        f"~{total_steps:,} total steps | "
+        f"{total_steps // args.eval_steps:,} evals ({eval_batches:,} batches/eval) | "
+        f"{total_steps // args.save_steps:,} saves",
         flush=True,
     )
 
@@ -278,8 +259,7 @@ def train(
         args=args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        sigreg_weight=0.1,
-        recon_weight=0.05,
+        sigreg_weight=0.01,
     )
 
     last_checkpoint = get_last_checkpoint(args.output_dir)
@@ -289,17 +269,17 @@ def train(
 
 if __name__ == "__main__":
     train(
-        context_len=10,
+        context_len=30,
         config=
         WorldModelConfig(
             height=240,
             width=320,
-            patch_size=16,
+            patch_size=20,
             dim=384,
             n_heads=4,
             n_blocks=8,
             ffn_mult=3,
             dropout_proba=0.1,
-            causal=True,
+            causal=False,
         ),
     )

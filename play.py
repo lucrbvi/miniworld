@@ -1,6 +1,8 @@
 import argparse
 import io
 import os
+import re
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -34,22 +36,45 @@ def config_for_checkpoint(model_path: str, state_dict: dict[str, torch.Tensor]) 
 
     config = WorldModelConfig()
     cls_token = state_dict.get("cls_token")
-    first_ffn = state_dict.get("transformer.ffn.0.0.weight")
+    patchify = state_dict.get("patchify.weight")
+    spatial_pos = state_dict.get("spatial_pos")
+    first_ffn = state_dict.get("encoder.layers.0.linear1.weight")
 
     if cls_token is not None:
         config.dim = cls_token.shape[-1]
+    if patchify is not None:
+        config.dim = patchify.shape[0]
+        config.patch_size = patchify.shape[-1]
     if first_ffn is not None and config.dim:
         config.ffn_mult = first_ffn.shape[0] // config.dim
 
-    block_ids = {
-        int(key.split(".")[2])
-        for key in state_dict
-        if key.startswith("transformer.blocks.") and key.split(".")[2].isdigit()
-    }
+    if spatial_pos is not None:
+        n_patches = spatial_pos.shape[1] - 1
+        default_patches = (config.height // config.patch_size) * (config.width // config.patch_size)
+        if n_patches != default_patches:
+            config.height, config.width = infer_image_size(n_patches, config.patch_size)
+
+    block_ids = set()
+    for key in state_dict:
+        match = re.match(r"(?:encoder|predictor)\.layers\.(\d+)\.", key)
+        if match:
+            block_ids.add(int(match.group(1)))
     if block_ids:
         config.n_blocks = max(block_ids) + 1
 
+    config.causal = True
     return config
+
+
+def infer_image_size(n_patches: int, patch_size: int) -> tuple[int, int]:
+    best_h, best_w = 1, n_patches
+    target_ratio = 4 / 3
+    for h in range(1, int(n_patches ** 0.5) + 1):
+        if n_patches % h == 0:
+            w = n_patches // h
+            if abs((w / h) - target_ratio) < abs((best_w / best_h) - target_ratio):
+                best_h, best_w = h, w
+    return best_h * patch_size, best_w * patch_size
 
 def get_device() -> str:
     if torch.cuda.is_available():
@@ -58,24 +83,53 @@ def get_device() -> str:
         return "mps"
     return "cpu"
 
+def load_state_dict_checked(model: WorldModel, state_dict: dict[str, torch.Tensor], source: str) -> None:
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as exc:
+        filtered = {k: v for k, v in state_dict.items() if not k.startswith("decoder.")}
+        result = model.load_state_dict(filtered, strict=False)
+        bad_missing = [k for k in result.missing_keys if not k.startswith("decoder.")]
+        bad_unexpected = [k for k in result.unexpected_keys if not k.startswith("decoder.")]
+        if bad_missing or bad_unexpected:
+            sample_keys = ", ".join(list(state_dict.keys())[:8])
+            raise RuntimeError(
+                f"Checkpoint {source!r} is not compatible with the WorldModel defined in model.py. "
+                f"First checkpoint keys: {sample_keys}"
+            ) from exc
+
+
 def load_world_model(model_path: str, device: str) -> WorldModel:
     if os.path.isdir(model_path):
-        config = WorldModelConfig.from_pretrained(model_path)
-        model = WorldModel(config)
+        config_path = os.path.join(model_path, "config.json")
         safetensors_path = os.path.join(model_path, "model.safetensors")
         torch_path = os.path.join(model_path, "pytorch_model.bin")
 
-        if os.path.isfile(safetensors_path):
-            model.load_state_dict(load_file(safetensors_path, device="cpu"))
-        elif os.path.isfile(torch_path):
-            model.load_state_dict(torch.load(torch_path, map_location="cpu"))
+        if os.path.isfile(config_path):
+            config = WorldModelConfig.from_pretrained(model_path)
+            model = WorldModel(config)
+            if os.path.isfile(safetensors_path):
+                load_state_dict_checked(model, load_file(safetensors_path, device="cpu"), safetensors_path)
+            elif os.path.isfile(torch_path):
+                load_state_dict_checked(model, torch.load(torch_path, map_location="cpu"), torch_path)
+            else:
+                load_sharded_checkpoint(model, model_path, strict=True, prefer_safe=True)
         else:
-            load_sharded_checkpoint(model, model_path, strict=True, prefer_safe=True)
+            candidates = sorted(Path(model_path).glob("*.safetensors"), key=lambda p: p.stat().st_mtime)
+            if not candidates:
+                raise FileNotFoundError(
+                    f"No config.json/model.safetensors found in {model_path!r}. "
+                    "Pass a Trainer checkpoint dir or a .safetensors file."
+                )
+            state_path = str(candidates[-1])
+            state_dict = load_file(state_path, device="cpu")
+            model = WorldModel(config_for_checkpoint(state_path, state_dict))
+            load_state_dict_checked(model, state_dict, state_path)
     elif model_path.endswith(".safetensors"):
         state_dict = load_file(model_path, device="cpu")
         config = config_for_checkpoint(model_path, state_dict)
         model = WorldModel(config)
-        model.load_state_dict(state_dict)
+        load_state_dict_checked(model, state_dict, model_path)
     else:
         raise ValueError("model_path must be a checkpoint directory or a .safetensors file")
 
@@ -132,17 +186,40 @@ def replace_texture(texture: rl.Texture, frame: np.ndarray) -> rl.Texture:
     rl.unload_texture(texture)
     return make_texture(frame)
 
+def autocast_context(device: str, enabled: bool):
+    if enabled and device == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
+@torch.inference_mode()
+def encode_frame(model: WorldModel, frame: torch.Tensor, device: str, amp: bool) -> torch.Tensor:
+    with autocast_context(device, amp):
+        _, tokens = model.encode(frame.unsqueeze(0).unsqueeze(0), return_tokens=True)
+    return tokens[:, 0]
+
+
 @torch.inference_mode()
 def predict_next_frame(
     model: WorldModel,
-    frames: list[torch.Tensor],
+    token_history: torch.Tensor,
     actions: list[list[float]],
+    max_context_len: int,
     device: str,
-) -> torch.Tensor:
-    x = torch.stack(frames, dim=0).unsqueeze(0)
-    action = torch.tensor(actions, device=device, dtype=torch.float32).unsqueeze(0)
-    _, pixel_pred = model(x, action)
-    return pixel_pred[0]
+    amp: bool,
+) -> tuple[torch.Tensor, torch.Tensor, list[list[float]]]:
+    actions = actions[-token_history.size(1) :]
+    action_tensor = torch.tensor(actions, device=device, dtype=torch.float32).unsqueeze(0)
+    with autocast_context(device, amp):
+        next_tokens = model.predict(token_history, action_tensor)[:, -1]
+        decoder_tokens = torch.cat([token_history, next_tokens.unsqueeze(1)], dim=1)
+        pixel_pred = model.decoder(decoder_tokens, action_tensor)[0]
+
+    token_history = torch.cat([token_history, next_tokens.unsqueeze(1)], dim=1)
+    if token_history.size(1) > max_context_len:
+        token_history = token_history[:, -max_context_len:]
+        actions = actions[-max_context_len + 1 :]
+    return pixel_pred, token_history, actions
 
 def draw_ui(action: list[float], fps: float, generated_count: int) -> None:
     active = [name for name, value in zip(ACTION_NAMES, action) if value]
@@ -155,11 +232,14 @@ def draw_ui(action: list[float], fps: float, generated_count: int) -> None:
 def run(args: argparse.Namespace) -> None:
     device = args.device or get_device()
     model = load_world_model(args.model, device)
+    if args.compile:
+        model = torch.compile(model)
     config = model.config
     frame = load_frame(args.frame, config.height, config.width)
+    frame_tensor = frame_to_tensor(frame, device)
 
-    frames = [frame_to_tensor(frame, device) for _ in range(args.context_len)]
-    actions = [[0.0] * len(ACTION_NAMES) for _ in range(args.context_len)]
+    token_history = encode_frame(model, frame_tensor, device, args.amp).unsqueeze(1)
+    actions = []
 
     rl.init_window(config.width * args.scale, config.height * args.scale, "miniworld")
     rl.set_target_fps(60)
@@ -175,11 +255,16 @@ def run(args: argparse.Namespace) -> None:
             now = rl.get_time()
 
             if now - last_step_time >= frame_interval:
-                action_context = [*actions[1:], action]
-                next_frame = predict_next_frame(model, frames, action_context, device)
+                actions.append(action)
+                next_frame, token_history, actions = predict_next_frame(
+                    model,
+                    token_history,
+                    actions,
+                    args.context_len,
+                    device,
+                    args.amp,
+                )
                 frame = tensor_to_frame(next_frame)
-                frames = [*frames[1:], frame_to_tensor(frame, device)]
-                actions = action_context
                 texture = replace_texture(texture, frame)
                 generated_count += 1
                 last_step_time = now
@@ -199,12 +284,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", default="./checkpoints", help="Checkpoint directory or .safetensors file")
     parser.add_argument("--frame", help="Initial DOOM frame image")
-    parser.add_argument("--context-len", type=int, default=16)
+    parser.add_argument("--context-len", type=int, default=10)
     parser.add_argument("--fps", type=float, default=1.0, help="World-model prediction rate")
     parser.add_argument("--scale", type=int, default=2, help="Window scale factor")
     parser.add_argument("--device", choices=["cpu", "mps", "cuda"], default=None)
+    parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable CUDA bf16 autocast")
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile for the model")
+    parser.set_defaults(amp=True)
     args = parser.parse_args()
 
+    if args.context_len < 1:
+        raise ValueError("--context-len must be >= 1")
+    if args.fps <= 0:
+        raise ValueError("--fps must be > 0")
+    if args.scale < 1:
+        raise ValueError("--scale must be >= 1")
     if args.frame is None:
         args.frame = input("Path to an initial DOOM frame: ").strip()
     if not Path(args.frame).is_file():

@@ -1,181 +1,25 @@
-"""
-Full implementation of our Latent World Model
-1. Encoder: A single layer CNN
-2. Transformer:
-    - Positional Encoding (TODO: try RoPE)
-    - GELU activation function (TODO: try SiLU)
-3. Decoder: A simple MLP
-"""
-
-import math
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
 from transformers import PreTrainedModel, PretrainedConfig
-from kernels import get_kernel
 
-_DEVICE = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "mps"
-    if torch.mps.is_available()
-    else "cpu"
-)
 
-if _DEVICE == "cuda":
-    _flash_attn = get_kernel("kernels-community/flash-attn3")
-    _flash_attn_func = _flash_attn.flash_attn_func
+class Projector(nn.Module):
+    """Projection head used as the LeJEPA embedding space."""
 
-class VisionEncoder(nn.Module):
-    """A very simple CNN layer to patchify images and generate N patches of D dimensions"""
-
-    def __init__(self, config: dict):
+    def __init__(self, dim: int):
         super().__init__()
-        assert (
-            config["height"] % config["patch_size"] == 0
-            and config["width"] % config["patch_size"] == 0
-        ), "patch_size must divide height and width!"
-
-        self.cnn = nn.Conv2d(
-            in_channels=3,  # RGB
-            out_channels=config["dim"],
-            kernel_size=config["patch_size"],
-            stride=config["patch_size"],
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.BatchNorm1d(dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim),
         )
-
-    def forward(self, x: Tensor):
-        C = x.size(1)
-        assert C == 3, (
-            f"Vision Encoder only support tensor with 3 channels (RGB), found: {C}"
-        )
-
-        # (B, D, H/patch, W/patch) -> (B, N, D)
-        return self.cnn(x).flatten(2).transpose(1, 2)
-
-# Positional Encoding
-def pe(x: Tensor):
-    shape = x.shape
-    seq_len, dim = shape[-2], shape[-1]
-    pos = torch.arange(seq_len, device=x.device).reshape(-1, 1).float()
-    div_term = torch.exp(
-        torch.arange(0, dim, 2, device=x.device).float() * (-math.log(10000.0) / dim)
-    )
-    pe_table = torch.zeros(seq_len, dim, device=x.device)
-    n_even = pe_table[:, 0::2].shape[1]
-    n_odd = pe_table[:, 1::2].shape[1]
-    pe_table[:, 0::2] = torch.sin(pos * div_term[:n_even])
-    pe_table[:, 1::2] = torch.cos(pos * div_term[:n_odd])
-    return x + pe_table
-
-# Attention
-def attn(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    dim: int,
-    mask: Tensor | None = None,
-    causal: bool = False,
-):
-    core = (q @ k.transpose(-2, -1)) / math.sqrt(dim)
-    if causal:
-        seq_len = q.size(-2)
-        causal_mask = torch.triu(
-            torch.full((seq_len, seq_len), -torch.inf, device=q.device),
-            diagonal=1,
-        )
-        core = core + causal_mask
-    if mask is not None:
-        core = core + mask
-    return F.softmax(core, dim=-1) @ v
-
-class MHAttention(nn.Module):
-    """Multi-Head Attention"""
-
-    def __init__(self, config: dict):
-        super().__init__()
-        self.dim = config["dim"]
-        self.n_heads = config["n_heads"]
-        self.h_dim = self.dim // self.n_heads
-        self.hidden = self.dim * config["ffn_mult"]
-        self.bound = 1 / math.sqrt(self.dim)
-        self.causal = config.get("causal", False)
-
-        self.blocks = nn.ModuleList(
-            [self._new_block() for _ in range(config["n_blocks"])]
-        )
-        self.ffn = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(self.dim, config["ffn_mult"] * self.dim),
-                    nn.GELU(),  # TODO: consider using SwiGLU
-                    nn.Linear(config["ffn_mult"] * self.dim, self.dim),
-                    nn.Dropout(p=config["dropout_proba"]),
-                )
-                for _ in range(config["n_blocks"])
-            ]
-        )
-
-        self.norms1 = nn.ModuleList(
-            [nn.LayerNorm(self.dim) for _ in range(config["n_blocks"])]
-        )
-        self.norms2 = nn.ModuleList(
-            [nn.LayerNorm(self.dim) for _ in range(config["n_blocks"])]
-        )
-
-    def _new_block(self):
-        return nn.ModuleDict(
-            {
-                "wq": nn.Linear(self.dim, self.n_heads * self.h_dim),
-                "wk": nn.Linear(self.dim, self.n_heads * self.h_dim),
-                "wv": nn.Linear(self.dim, self.n_heads * self.h_dim),
-                "wo": nn.Linear(self.n_heads * self.h_dim, self.dim, bias=False),
-            }
-        )
-
-    def attn(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-        B, N, H, D = q.shape
-        if _DEVICE == "cuda":
-            # Flash Attention requires float16 or bfloat16
-            # Convert to float16 if in float32
-            orig_dtype = q.dtype
-            if orig_dtype == torch.float32:
-                q = q.half()
-                k = k.half()
-                v = v.half()
-            out = _flash_attn_func(
-                q,
-                k,
-                v,
-                causal=self.causal,
-                return_attn_probs=False,
-            )
-            # Convert back to original dtype if needed
-            if orig_dtype == torch.float32:
-                out = out.float()
-        else:
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-            out = attn(q, k, v, self.h_dim, causal=self.causal).transpose(1, 2)
-        return out.reshape(B, N, -1)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = pe(x)
-        B, N, _ = x.shape
+        shape = x.shape
+        return self.net(x.reshape(-1, shape[-1])).view(shape)
 
-        for i, block in enumerate(self.blocks):
-            normed = self.norms1[i](x)
-            q = block["wq"](normed).view(B, N, self.n_heads, self.h_dim)
-            k = block["wk"](normed).view(B, N, self.n_heads, self.h_dim)
-            v = block["wv"](normed).view(B, N, self.n_heads, self.h_dim)
-
-            out = self.attn(q, k, v)
-            x = block["wo"](out) + x
-            x = self.ffn[i](self.norms2[i](x)) + x
-
-        return x
 
 class Decoder(nn.Module):
     def __init__(self, config: dict):
@@ -187,24 +31,38 @@ class Decoder(nn.Module):
         n_queries = self.grid_h * self.grid_w
         patch_dim = self.patch_size * self.patch_size * 3
 
-        # Learnable spatial queries (one per output patch)
         self.queries = nn.Parameter(torch.randn(n_queries, dim))
-
-        self.cross = nn.MultiheadAttention(dim, num_heads=4, batch_first=True)
+        self.action_embedding = nn.Linear(9, dim)
+        self.cross = nn.MultiheadAttention(dim, num_heads=config.get("n_heads", 4), batch_first=True)
         self.norm = nn.LayerNorm(dim)
-
+        layer = nn.TransformerEncoderLayer(
+            d_model=dim,
+            nhead=config.get("n_heads", 4),
+            dim_feedforward=config.get("ffn_mult", 3) * dim,
+            dropout=config.get("dropout_proba", 0.1),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.blocks = nn.TransformerEncoder(layer, num_layers=1)
         self.to_patch = nn.Sequential(
             nn.Linear(dim, dim),
             nn.GELU(),
             nn.Linear(dim, patch_dim),
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, tokens: Tensor, actions: Tensor) -> Tensor:
+        if actions.size(1) == tokens.size(1) - 1:
+            pad = actions.new_zeros(actions.size(0), 1, actions.size(2))
+            actions = torch.cat([pad, actions], dim=1)
+
+        x = tokens + self.action_embedding(actions.float()).unsqueeze(2)
         B = x.size(0)
-        q = self.queries.unsqueeze(0).expand(B, -1, -1) # (B, N_queries, D)
-        out, _ = self.cross(q, x, x)
-        out = self.norm(out + q)
-        patches = torch.sigmoid(self.to_patch(out)) # (B, N_queries, patch_dim)
+        x = x.reshape(B, -1, x.size(-1))
+        q = self.queries.unsqueeze(0).expand(B, -1, -1)
+        out, _ = self.cross(q, x, x, need_weights=False)
+        out = self.blocks(self.norm(out + q))
+        patches = torch.sigmoid(self.to_patch(out))
         return fold_patches(
             patches,
             self.grid_h * self.patch_size,
@@ -212,34 +70,15 @@ class Decoder(nn.Module):
             self.patch_size,
         )
 
-class Projector(nn.Module):
-    """Small projection head used to stabilize training"""
 
-    def __init__(self, dim: int):
-        super().__init__()
-        self.model = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.BatchNorm1d(dim * 4),
-            nn.GELU(),
-            nn.Linear(dim * 4, dim),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        shape = x.shape
-        return self.model(x.reshape(-1, shape[-1])).view(shape)
-
-# (B, N, patch_size*patch_size*3) -> (B, 3, H, W)
 def fold_patches(x: Tensor, height: int, width: int, patch_size: int) -> Tensor:
     B = x.size(0)
     n_h = height // patch_size
     n_w = width // patch_size
-
-    # (B, N, 3, p, p) -> (B, n_h, n_w, 3, p, p)
     x = x.view(B, n_h, n_w, 3, patch_size, patch_size)
-
-    # (B, 3, H, W)
     x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
     return x.view(B, 3, height, width)
+
 
 class WorldModelConfig(PretrainedConfig):
     model_type = "world_model"
@@ -254,9 +93,10 @@ class WorldModelConfig(PretrainedConfig):
         n_blocks: int = 3,
         ffn_mult: int = 3,
         dropout_proba: float = 0.1,
-        causal: bool = False,
+        causal: bool = True,
         **kwargs,
     ):
+        super().__init__(**kwargs)
         self.height = height
         self.width = width
         self.patch_size = patch_size
@@ -266,78 +106,112 @@ class WorldModelConfig(PretrainedConfig):
         self.ffn_mult = ffn_mult
         self.dropout_proba = dropout_proba
         self.causal = causal
-        super().__init__(**kwargs)
+
 
 class WorldModel(PreTrainedModel):
+    config_class = WorldModelConfig
+
     def __init__(self, config: WorldModelConfig):
         super().__init__(config)
-        mh_config = {
-            "dim": config.dim,
-            "n_heads": config.n_heads,
-            "n_blocks": config.n_blocks,
-            "ffn_mult": config.ffn_mult,
-            "dropout_proba": config.dropout_proba,
-            "causal": config.causal,
-        }
-        self.encoder = VisionEncoder(
-            {
-                **mh_config,
-                "height": config.height,
-                "width": config.width,
-                "patch_size": config.patch_size,
-            }
+        assert config.height % config.patch_size == 0
+        assert config.width % config.patch_size == 0
+
+        self.n_patches = (config.height // config.patch_size) * (
+            config.width // config.patch_size
         )
-        self.transformer = MHAttention(mh_config)
-        self.decoder = Decoder(
-            {
-                **mh_config,
-                "height": config.height,
-                "width": config.width,
-                "patch_size": config.patch_size,
-            }
-        )
-        self.encoder_projector = Projector(config.dim)
-        self.predictor_projector = Projector(config.dim)
-        self.state_token = nn.Parameter(torch.randn(1, 1, config.dim) * 0.02)
-        self.state_pooler = nn.MultiheadAttention(
+
+        self.patchify = nn.Conv2d(
+            3,
             config.dim,
-            num_heads=config.n_heads,
+            kernel_size=config.patch_size,
+            stride=config.patch_size,
+        )
+        self.cls_token = nn.Parameter(torch.randn(1, 1, config.dim) * 0.02)
+        self.spatial_pos = nn.Parameter(
+            torch.randn(1, self.n_patches + 1, config.dim) * 0.02
+        )
+
+        spatial_layer = nn.TransformerEncoderLayer(
+            d_model=config.dim,
+            nhead=config.n_heads,
+            dim_feedforward=config.ffn_mult * config.dim,
+            dropout=config.dropout_proba,
+            activation="gelu",
             batch_first=True,
+            norm_first=True,
         )
+        self.encoder = nn.TransformerEncoder(spatial_layer, num_layers=config.n_blocks)
+        self.encoder_projector = Projector(config.dim)
+
         self.action_embedding = nn.Linear(9, config.dim)
-        self.pred_token = nn.Parameter(torch.randn(1, 1, config.dim) * 0.02)
-
-    @property
-    def n_patches(self) -> int:
-        return (self.config.height // self.config.patch_size) * (
-            self.config.width // self.config.patch_size
+        temporal_layer = nn.TransformerEncoderLayer(
+            d_model=config.dim,
+            nhead=config.n_heads,
+            dim_feedforward=config.ffn_mult * config.dim,
+            dropout=config.dropout_proba,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
         )
+        self.predictor = nn.TransformerEncoder(temporal_layer, num_layers=config.n_blocks)
+        self.predictor_projector = Projector(config.dim)
 
-    def encode_sequence(self, frames: Tensor) -> Tensor:
-        batch_size, seq_len, C, H, W = frames.shape
-        flat_frames = frames.reshape(batch_size * seq_len, C, H, W)
-        patch_latents = self.encoder(flat_frames)
+        self.decoder = Decoder(config.to_dict())
 
-        state_token = self.state_token.expand(batch_size * seq_len, -1, -1)
-        states, _ = self.state_pooler(state_token, patch_latents, patch_latents)
-        states = states.squeeze(1).view(batch_size, seq_len, self.config.dim)
-        return self.encoder_projector(states)
-
-    def predict_latent(self, latents: Tensor, actions: Tensor) -> Tensor:
-        batch_size, seq_len, dim = latents.shape
-        action_tokens = self.action_embedding(actions.float())
-        context_tokens = latents + action_tokens
-        pred_token = self.pred_token.expand(batch_size, -1, -1) + action_tokens[:, -1:]
-        x = torch.cat([context_tokens, pred_token], dim=1)
-        return self.predictor_projector(self.transformer(x)[:, -1])
-
-    def forward(self, frames: Tensor, actions: Tensor, decode: bool = False):
+    def encode(self, frames: Tensor, return_tokens: bool = False):
         if frames.dim() == 4:
             frames = frames.unsqueeze(1)
+
+        batch_size, seq_len, channels, height, width = frames.shape
+        frames = frames.reshape(batch_size * seq_len, channels, height, width)
+        if frames.is_cuda:
+            frames = frames.contiguous(memory_format=torch.channels_last)
+
+        patches = self.patchify(frames).flatten(2).transpose(1, 2)
+        cls = self.cls_token.expand(patches.size(0), -1, -1)
+        tokens = torch.cat([cls, patches], dim=1) + self.spatial_pos
+        tokens = self.encoder(tokens)
+        tokens = self.encoder_projector(tokens)
+
+        tokens = tokens.view(batch_size, seq_len, self.n_patches + 1, self.config.dim)
+        states = tokens[:, :, 0]
+        if not return_tokens:
+            return states
+        return states, tokens
+
+    def predict(self, states: Tensor, actions: Tensor) -> Tensor:
+        token_input = states.dim() == 4
+        if states.dim() == 2:
+            states = states.unsqueeze(1)
+        if actions.dim() == 2:
             actions = actions.unsqueeze(1)
 
-        latents = self.encode_sequence(frames)
-        pred_latents = self.predict_latent(latents, actions)
+        if token_input:
+            B, T, N, D = states.shape
+            action = self.action_embedding(actions.float()).unsqueeze(2)
+            tokens = (states + action).permute(0, 2, 1, 3).reshape(B * N, T, D)
+        else:
+            tokens = states + self.action_embedding(actions.float())
+
+        mask = None
+        if self.config.causal:
+            seq_len = tokens.size(1)
+            mask = torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=tokens.device),
+                diagonal=1,
+            )
+
+        pred_states = self.predictor_projector(self.predictor(tokens, mask=mask))
+        if token_input:
+            pred_states = pred_states.view(B, N, T, D).permute(0, 2, 1, 3).contiguous()
+        return pred_states
+
+    def forward(self, frames: Tensor, actions: Tensor, decode: bool = False):
         if not decode:
-            return pred_latents
-        return pred_latents, self.decoder(pred_latents.unsqueeze(1))
+            states = self.encode(frames)
+            return self.predict(states, actions)
+
+        _, tokens = self.encode(frames, return_tokens=True)
+        pred_tokens = self.predict(tokens, actions)
+        decoder_tokens = torch.cat([tokens, pred_tokens[:, -1:]], dim=1)
+        return pred_tokens[:, :, 0], self.decoder(decoder_tokens, actions)

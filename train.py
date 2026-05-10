@@ -1,3 +1,4 @@
+import json
 import math
 import os
 
@@ -5,11 +6,16 @@ import lejepa
 import numpy as np
 import torch
 import torch.nn.functional as F
+import wandb
 from datasets import Dataset as HFDataset, load_dataset
 from transformers import Trainer, TrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
 
 from model import WorldModel, WorldModelConfig
+
+
+def find_last_checkpoint(path: str) -> str | None:
+    return get_last_checkpoint(path) if os.path.isdir(path) else None
 
 class WMDataset(torch.utils.data.Dataset):
     """Contiguous frame windows for next-latent prediction."""
@@ -81,21 +87,49 @@ class WMDataset(torch.utils.data.Dataset):
         if frames.dtype == object:
             return np.stack([WMDataset._frame_to_chw(frame) for frame in frames])
         if frames.shape[-1] == 3:
-            return np.transpose(frames, (0, 3, 1, 2))
-        return frames
+            frames = np.transpose(frames, (0, 3, 1, 2))
+        return np.ascontiguousarray(frames)
+
+class DecoderTrainer(Trainer):
+    @staticmethod
+    def scalar(value: torch.Tensor) -> float:
+        return value.detach().float().cpu().item()
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad(), self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+        return loss.detach().mean(), None, None
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        frames = inputs["frames"].float() / 255.0
+        target_frame = inputs["target_frame"].float() / 255.0
+        actions = inputs["actions"]
+
+        with torch.no_grad():
+            observations = torch.cat([frames, target_frame.unsqueeze(1)], dim=1)
+            _, tokens = model.encode(observations, return_tokens=True)
+            pred_tokens = model.predict(tokens[:, :-1], actions)
+            pred_sequence = torch.cat([tokens[:, :-1], pred_tokens[:, -1:]], dim=1)
+
+        true_recon = model.decoder(tokens.detach(), actions)
+        pred_recon = model.decoder(pred_sequence.detach(), actions)
+        loss = F.l1_loss(true_recon, target_frame) + F.l1_loss(pred_recon, target_frame)
+
+        if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
+            self.log({"decoder_loss": self.scalar(loss)})
+
+        if return_outputs:
+            return loss, {"true_recon": true_recon.detach(), "pred_recon": pred_recon.detach()}
+        return loss
 
 class WMTrainer(Trainer):
-    def __init__(
-        self,
-        *args,
-        sigreg_weight: float = 0.1,
-        **kwargs,
-    ):
+    def __init__(self, *args, sigreg_weight: float = 0.1, **kwargs):
         super().__init__(*args, **kwargs)
         self.sigreg_weight = sigreg_weight
         self.sigreg = lejepa.multivariate.SlicingUnivariateTest(
             univariate_test=lejepa.univariate.EppsPulley(n_points=17),
-            num_slices=512,
+            num_slices=1024,
         )
         self._sigreg_device = None
 
@@ -118,22 +152,22 @@ class WMTrainer(Trainer):
             self.sigreg = self.sigreg.to(frames.device)
             self._sigreg_device = frames.device
 
-        context_z = model.encode_sequence(frames)
-        target_z = model.encode_sequence(target_frame).squeeze(1)
-        pred_z = model.predict_latent(context_z, actions)
+        observations = torch.cat([frames, target_frame], dim=1)
+        embeddings, tokens = model.encode(observations, return_tokens=True)
+        pred_tokens = model.predict(tokens[:, :-1], actions)
+        target_tokens = tokens[:, 1:]
 
-        sigreg_z = torch.cat(
-            [context_z.flatten(0, 1), target_z],
-            dim=0,
-        )
-        sigreg_loss = self.sigreg(sigreg_z)
-        pred_loss = F.mse_loss(pred_z, target_z)
-
+        sigreg_loss = torch.stack(
+            [self.sigreg(embeddings[:, t]) for t in range(embeddings.size(1))]
+        ).mean()
+        pred_loss = F.mse_loss(pred_tokens, target_tokens)
         loss = pred_loss + self.sigreg_weight * sigreg_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
-            flat_z = sigreg_z
+            flat_z = embeddings.flatten(0, 1)
             z_std = flat_z.std(dim=0)
+            pred_z = pred_tokens[:, :, 0]
+            target_z = embeddings[:, 1:]
             self.log(
                 {
                     "loss_total": self.scalar(loss),
@@ -142,15 +176,15 @@ class WMTrainer(Trainer):
                     "z_std_mean": self.scalar(z_std.mean()),
                     "z_std_min": self.scalar(z_std.min()),
                     "z_norm_mean": self.scalar(flat_z.norm(dim=-1).mean()),
-                    "pred_std": self.scalar(pred_z.std(dim=0).mean()),
-                    "target_std": self.scalar(target_z.std(dim=0).mean()),
+                    "pred_std": self.scalar(pred_z.std(dim=(0, 1)).mean()),
+                    "target_std": self.scalar(target_z.std(dim=(0, 1)).mean()),
                 }
             )
 
         if return_outputs:
             return loss, {
-                "pred_emb": pred_z.detach(),
-                "target_emb": target_z.detach(),
+                "pred_tokens": pred_tokens.detach(),
+                "target_tokens": target_tokens.detach(),
             }
         return loss
 
@@ -166,10 +200,14 @@ def train(
     context_len: int = 16,
     sequence_stride: int = 1,
     max_eval_sequences: int = 2048,
+    decoder_only: bool = True,
 ):
     device = device_name()
     if device == "cuda":
         torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
 
     print(f"Device: {device} | Config: {config.to_dict()}", flush=True)
     print("Loading dataset...", flush=True)
@@ -211,30 +249,32 @@ def train(
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}", flush=True)
 
     args = TrainingArguments(
-        output_dir="./checkpoints",
+        output_dir="./checkpoints/world-model",
         num_train_epochs=1,
         max_steps=-1,
-        per_device_train_batch_size=128,
-        per_device_eval_batch_size=128,
+        per_device_train_batch_size=40,
+        per_device_eval_batch_size=40,
         gradient_accumulation_steps=1,
         learning_rate=5e-5,
         warmup_steps=0,
         weight_decay=1e-3,
         max_grad_norm=1.0,
         bf16=device == "cuda",
-        logging_steps=5,
+        logging_steps=20,
         logging_first_step=False,
         eval_strategy="steps",
         eval_steps=1000,
         save_strategy="steps",
         save_steps=1000,
         load_best_model_at_end=False,
-        dataloader_num_workers=4,
-        dataloader_prefetch_factor=1,
+        dataloader_num_workers=16,
+        dataloader_prefetch_factor=4,
         dataloader_pin_memory=True,
         dataloader_persistent_workers=True,
         remove_unused_columns=False,
         report_to=["wandb"],
+        run_name="world-model",
+        optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
         torch_compile=True,
     )
 
@@ -254,32 +294,93 @@ def train(
         flush=True,
     )
 
-    trainer = WMTrainer(
+    last_checkpoint = find_last_checkpoint(args.output_dir) or find_last_checkpoint("./checkpoints")
+    if last_checkpoint is not None:
+        ckpt_config = os.path.join(last_checkpoint, "config.json")
+        if os.path.isfile(ckpt_config):
+            with open(ckpt_config) as f:
+                old_config = json.load(f)
+            for key in ("height", "width", "patch_size", "dim", "n_heads", "n_blocks", "ffn_mult"):
+                if old_config.get(key) != getattr(config, key):
+                    print(f"Ignoring incompatible checkpoint: {last_checkpoint}", flush=True)
+                    last_checkpoint = None
+                    break
+
+    if decoder_only:
+        if last_checkpoint is None:
+            raise RuntimeError("No compatible world-model checkpoint found for decoder training")
+        print(f"Loading world model from checkpoint: {last_checkpoint}", flush=True)
+        from safetensors.torch import load_file
+        model.load_state_dict(load_file(os.path.join(last_checkpoint, "model.safetensors"), device="cpu"))
+    else:
+        trainer = WMTrainer(
+            model=model,
+            args=args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            sigreg_weight=0.2,
+        )
+        if last_checkpoint is not None:
+            print(f"Resuming from checkpoint: {last_checkpoint}", flush=True)
+        trainer.train(resume_from_checkpoint=last_checkpoint)
+        wandb.finish()
+
+    for param in model.parameters():
+        param.requires_grad = False
+    for param in model.decoder.parameters():
+        param.requires_grad = True
+
+    model.encoder.eval()
+    model.encoder_projector.eval()
+    model.predictor.eval()
+    model.predictor_projector.eval()
+
+    decoder_args = TrainingArguments(
+        output_dir="./checkpoints/decoder",
+        num_train_epochs=1,
+        per_device_train_batch_size=args.per_device_train_batch_size * 3,
+        per_device_eval_batch_size=args.per_device_eval_batch_size * 3,
+        learning_rate=1e-4,
+        weight_decay=1e-4,
+        bf16=device == "cuda",
+        logging_steps=20,
+        eval_strategy="steps",
+        eval_steps=1000,
+        save_strategy="steps",
+        save_steps=1000,
+        dataloader_num_workers=args.dataloader_num_workers,
+        dataloader_prefetch_factor=args.dataloader_prefetch_factor,
+        dataloader_pin_memory=True,
+        dataloader_persistent_workers=True,
+        remove_unused_columns=False,
+        report_to=["wandb"],
+        run_name="decoder-probe",
+        optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
+        torch_compile=False,
+    )
+    decoder_checkpoint = find_last_checkpoint(decoder_args.output_dir)
+    if decoder_checkpoint is not None:
+        print(f"Resuming decoder from checkpoint: {decoder_checkpoint}", flush=True)
+    DecoderTrainer(
         model=model,
-        args=args,
+        args=decoder_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        sigreg_weight=0.01,
-    )
-
-    last_checkpoint = get_last_checkpoint(args.output_dir)
-    if last_checkpoint is not None:
-        print(f"Resuming from checkpoint: {last_checkpoint}", flush=True)
-    trainer.train(resume_from_checkpoint=last_checkpoint)
+    ).train(resume_from_checkpoint=decoder_checkpoint)
 
 if __name__ == "__main__":
     train(
-        context_len=30,
+        context_len=10,
         config=
         WorldModelConfig(
             height=240,
             width=320,
-            patch_size=20,
-            dim=384,
-            n_heads=4,
-            n_blocks=8,
+            patch_size=16,
+            dim=480,
+            n_heads=8,
+            n_blocks=3,
             ffn_mult=3,
             dropout_proba=0.1,
-            causal=False,
+            causal=True,
         ),
     )

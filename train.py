@@ -92,6 +92,19 @@ class WMDataset(torch.utils.data.Dataset):
         return np.ascontiguousarray(frames)
 
 class DecoderTrainer(Trainer):
+    def create_optimizer(self):
+        if self.optimizer is None:
+            low_lr = self.args.learning_rate * 0.1
+            self.optimizer = torch.optim.AdamW(
+                [
+                    {"params": [p for p in self.model.decoder.parameters() if p.requires_grad], "lr": self.args.learning_rate},
+                    {"params": [p for p in self.model.predictor.projector.parameters() if p.requires_grad], "lr": low_lr},
+                    {"params": [p for p in self.model.predictor.blocks.blocks[-1].parameters() if p.requires_grad], "lr": low_lr},
+                ],
+                weight_decay=self.args.weight_decay,
+            )
+        return self.optimizer
+
     @staticmethod
     def scalar(value: torch.Tensor) -> float:
         return value.detach().float().cpu().item()
@@ -111,11 +124,11 @@ class DecoderTrainer(Trainer):
         with torch.no_grad():
             observations = torch.cat([frames, target_frame.unsqueeze(1)], dim=1)
             _, tokens = model.encode(observations, return_tokens=True)
-            pred_tokens = model.predict(tokens[:, :-1], actions)
-            pred_sequence = torch.cat([tokens[:, :-1], pred_tokens[:, -1:]], dim=1)
+        pred_tokens = model.predict(tokens[:, :-1], actions)
+        pred_sequence = torch.cat([tokens[:, :-1], pred_tokens[:, -1:]], dim=1)
 
-        true_recon = model.decoder(tokens[:, -1, 0].detach())
-        pred_recon = model.decoder(pred_sequence[:, -1, 0].detach())
+        true_recon = model.decoder(tokens.detach(), actions)
+        pred_recon = model.decoder(pred_sequence, actions)
         loss = F.l1_loss(true_recon.float(), target_frame.float()) + F.l1_loss(pred_recon.float(), target_frame.float())
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
@@ -274,8 +287,8 @@ def train(
         output_dir=wm_output_dir,
         num_train_epochs=1,
         max_steps=-1,
-        per_device_train_batch_size=25,
-        per_device_eval_batch_size=25,
+        per_device_train_batch_size=60,
+        per_device_eval_batch_size=60,
         gradient_accumulation_steps=1,
         learning_rate=5e-5,
         warmup_steps=0,
@@ -351,15 +364,15 @@ def train(
             "Pass --wm-checkpoint or train with --mode wm first."
         )
     print(f"Loading pretrained world model from: {pretrained_checkpoint}", flush=True)
-    model = WorldModel.from_pretrained(pretrained_checkpoint).to(torch.bfloat16)
+    model = WorldModel.from_pretrained(pretrained_checkpoint, ignore_mismatched_sizes=True).to(torch.bfloat16)
 
     for param in model.parameters():
         param.requires_grad = False
-    for param in model.decoder.parameters():
-        param.requires_grad = True
+    for module in (model.decoder, model.predictor.projector, model.predictor.blocks.blocks[-1]):
+        for param in module.parameters():
+            param.requires_grad = True
 
     model.encoder.eval()
-    model.predictor.eval()
 
     decoder_args = TrainingArguments(
         output_dir=decoder_output_dir,

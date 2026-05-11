@@ -137,28 +137,38 @@ class Decoder(nn.Module):
         self.n_patches = self.grid_h * self.grid_w
         patch_dim = config.patch_size * config.patch_size * 3
 
-        self.cls_proj = nn.Linear(config.dim, config.dim)
+        self.action_proj = nn.Linear(config.action_dim, config.dim)
         self.queries = nn.Parameter(torch.randn(1, self.n_patches, config.dim) * 0.02)
-        self.pos = nn.Parameter(torch.randn(1, self.n_patches, config.dim) * 0.02)
+        self.query_pos = nn.Parameter(torch.randn(1, self.n_patches, config.dim) * 0.02)
+        self.memory_pos = nn.Parameter(torch.randn(1, config.max_seq_len * self.n_patches, config.dim) * 0.02)
         self.blocks = nn.ModuleList(
             [CrossAttentionBlock(config.dim, config.n_heads, config.ffn_mult, config.dropout_proba) for _ in range(config.decoder_blocks)]
         )
         self.norm = nn.LayerNorm(config.dim)
         self.to_patch = nn.Linear(config.dim, patch_dim)
 
-    def forward(self, cls: Tensor) -> Tensor:
-        if cls.dim() != 2:
-            raise ValueError(f"Decoder expects only CLS tokens with shape BxD, got {tuple(cls.shape)}")
+    def forward(self, tokens: Tensor, actions: Tensor | None = None) -> Tensor:
+        if tokens.dim() == 3:
+            tokens = tokens.unsqueeze(1)
+        patches_memory = tokens[:, :, 1:]  # all image patches from the whole context/prediction sequence
+        b, t, n, d = patches_memory.shape
+        memory = patches_memory.reshape(b, t * n, d)
+        if memory.size(1) > self.memory_pos.size(1):
+            raise ValueError(f"Decoder memory too long: {memory.size(1)} > {self.memory_pos.size(1)}")
+        memory = memory + self.memory_pos[:, : memory.size(1)]
+        if actions is not None:
+            if actions.dim() == 2:
+                actions = actions.unsqueeze(1)
+            memory = torch.cat([memory, self.action_proj(actions.to(dtype=tokens.dtype))], dim=1)
 
-        memory = self.cls_proj(cls).unsqueeze(1)
-        x = self.queries.expand(cls.size(0), -1, -1) + self.pos
+        x = self.queries.expand(b, -1, -1) + self.query_pos
         for block in self.blocks:
             x = block(x, memory)
         patches = self.to_patch(self.norm(x))
         p = self.patch_size
-        img = patches.view(cls.size(0), self.grid_h, self.grid_w, 3, p, p)
+        img = patches.view(b, self.grid_h, self.grid_w, 3, p, p)
         img = img.permute(0, 3, 1, 4, 2, 5).contiguous()
-        return torch.sigmoid(img.view(cls.size(0), 3, self.grid_h * p, self.grid_w * p))
+        return torch.sigmoid(img.view(b, 3, self.grid_h * p, self.grid_w * p))
 
 class WorldModelConfig(PretrainedConfig):
     model_type = "world_model"
@@ -227,4 +237,4 @@ class WorldModel(PreTrainedModel):
             return self.predict(tokens, actions)
         _, tokens = self.encode(frames, return_tokens=True)
         pred_tokens = self.predict(tokens, actions)
-        return pred_tokens[:, :, 0], self.decoder(pred_tokens[:, -1, 0])
+        return pred_tokens[:, :, 0], self.decoder(pred_tokens, actions)

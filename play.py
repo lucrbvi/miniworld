@@ -212,8 +212,7 @@ def predict_next_frame(
     action_tensor = torch.tensor(actions, device=device, dtype=torch.float32).unsqueeze(0)
     with autocast_context(device, amp):
         next_tokens = model.predict(token_history, action_tensor)[:, -1]
-        decoder_tokens = torch.cat([token_history, next_tokens.unsqueeze(1)], dim=1)
-        pixel_pred = model.decoder(decoder_tokens, action_tensor)[0]
+        pixel_pred = model.decoder(next_tokens[:, 0])[0]
 
     token_history = torch.cat([token_history, next_tokens.unsqueeze(1)], dim=1)
     if token_history.size(1) > max_context_len:

@@ -1,3 +1,4 @@
+import argparse
 import json
 import math
 import os
@@ -102,9 +103,10 @@ class DecoderTrainer(Trainer):
         return loss.detach().mean(), None, None
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        frames = inputs["frames"].float() / 255.0
-        target_frame = inputs["target_frame"].float() / 255.0
-        actions = inputs["actions"]
+        dtype = next(model.parameters()).dtype
+        frames = inputs["frames"].to(dtype=dtype) / 255.0
+        target_frame = inputs["target_frame"].to(dtype=dtype) / 255.0
+        actions = inputs["actions"].to(dtype=dtype)
 
         with torch.no_grad():
             observations = torch.cat([frames, target_frame.unsqueeze(1)], dim=1)
@@ -112,9 +114,9 @@ class DecoderTrainer(Trainer):
             pred_tokens = model.predict(tokens[:, :-1], actions)
             pred_sequence = torch.cat([tokens[:, :-1], pred_tokens[:, -1:]], dim=1)
 
-        true_recon = model.decoder(tokens.detach(), actions)
-        pred_recon = model.decoder(pred_sequence.detach(), actions)
-        loss = F.l1_loss(true_recon, target_frame) + F.l1_loss(pred_recon, target_frame)
+        true_recon = model.decoder(tokens[:, -1, 0].detach())
+        pred_recon = model.decoder(pred_sequence[:, -1, 0].detach())
+        loss = F.l1_loss(true_recon.float(), target_frame.float()) + F.l1_loss(pred_recon.float(), target_frame.float())
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
             self.log({"decoder_loss": self.scalar(loss)})
@@ -144,9 +146,10 @@ class WMTrainer(Trainer):
         return loss.detach().mean(), None, None
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        frames = inputs["frames"].float() / 255.0
-        target_frame = (inputs["target_frame"].float() / 255.0).unsqueeze(1)
-        actions = inputs["actions"]
+        dtype = next(model.parameters()).dtype
+        frames = inputs["frames"].to(dtype=dtype) / 255.0
+        target_frame = (inputs["target_frame"].to(dtype=dtype) / 255.0).unsqueeze(1)
+        actions = inputs["actions"].to(dtype=dtype)
 
         if self._sigreg_device != frames.device:
             self.sigreg = self.sigreg.to(frames.device)
@@ -158,9 +161,9 @@ class WMTrainer(Trainer):
         target_tokens = tokens[:, 1:]
 
         sigreg_loss = torch.stack(
-            [self.sigreg(embeddings[:, t]) for t in range(embeddings.size(1))]
+            [self.sigreg(embeddings[:, t].float()) for t in range(embeddings.size(1))]
         ).mean()
-        pred_loss = F.mse_loss(pred_tokens, target_tokens)
+        pred_loss = F.mse_loss(pred_tokens.float(), target_tokens.float())
         loss = pred_loss + self.sigreg_weight * sigreg_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
@@ -195,13 +198,28 @@ def device_name() -> str:
         return "mps"
     return "cpu"
 
+
+def resolve_checkpoint(resume_from: str | None, output_dir: str) -> str | None:
+    if resume_from is None or resume_from == "none":
+        return None
+    if resume_from == "auto":
+        return find_last_checkpoint(output_dir)
+    if not os.path.isdir(resume_from):
+        raise FileNotFoundError(f"Checkpoint not found: {resume_from}")
+    return resume_from
+
 def train(
     config: WorldModelConfig,
+    mode: str = "wm",
+    output_root: str = "./checkpoints",
+    resume_from: str | None = "auto",
+    wm_checkpoint: str | None = None,
     context_len: int = 16,
     sequence_stride: int = 1,
     max_eval_sequences: int = 2048,
-    decoder_only: bool = True,
 ):
+    if mode not in {"wm", "decoder"}:
+        raise ValueError("mode must be 'wm' or 'decoder'")
     device = device_name()
     if device == "cuda":
         torch.set_float32_matmul_precision("high")
@@ -244,16 +262,20 @@ def train(
     )
 
     os.environ.setdefault("WANDB_PROJECT", "miniworld-wm")
+    os.makedirs(output_root, exist_ok=True)
 
-    model = WorldModel(config)
+    model = WorldModel(config).to(torch.bfloat16)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}", flush=True)
 
+    wm_output_dir = os.path.join(output_root, "world-model")
+    decoder_output_dir = os.path.join(output_root, "decoder")
+
     args = TrainingArguments(
-        output_dir="./checkpoints/world-model",
+        output_dir=wm_output_dir,
         num_train_epochs=1,
         max_steps=-1,
-        per_device_train_batch_size=40,
-        per_device_eval_batch_size=40,
+        per_device_train_batch_size=25,
+        per_device_eval_batch_size=25,
         gradient_accumulation_steps=1,
         learning_rate=5e-5,
         warmup_steps=0,
@@ -263,9 +285,9 @@ def train(
         logging_steps=20,
         logging_first_step=False,
         eval_strategy="steps",
-        eval_steps=1000,
+        eval_steps=2000,
         save_strategy="steps",
-        save_steps=1000,
+        save_steps=2000,
         load_best_model_at_end=False,
         dataloader_num_workers=16,
         dataloader_prefetch_factor=4,
@@ -294,7 +316,7 @@ def train(
         flush=True,
     )
 
-    last_checkpoint = find_last_checkpoint(args.output_dir) or find_last_checkpoint("./checkpoints")
+    last_checkpoint = resolve_checkpoint(resume_from, args.output_dir)
     if last_checkpoint is not None:
         ckpt_config = os.path.join(last_checkpoint, "config.json")
         if os.path.isfile(ckpt_config):
@@ -306,13 +328,7 @@ def train(
                     last_checkpoint = None
                     break
 
-    if decoder_only:
-        if last_checkpoint is None:
-            raise RuntimeError("No compatible world-model checkpoint found for decoder training")
-        print(f"Loading world model from checkpoint: {last_checkpoint}", flush=True)
-        from safetensors.torch import load_file
-        model.load_state_dict(load_file(os.path.join(last_checkpoint, "model.safetensors"), device="cpu"))
-    else:
+    if mode == "wm":
         trainer = WMTrainer(
             model=model,
             args=args,
@@ -321,9 +337,21 @@ def train(
             sigreg_weight=0.2,
         )
         if last_checkpoint is not None:
-            print(f"Resuming from checkpoint: {last_checkpoint}", flush=True)
+            print(f"Resuming world-model training from: {last_checkpoint}", flush=True)
         trainer.train(resume_from_checkpoint=last_checkpoint)
+        trainer.model.to(torch.bfloat16)
+        trainer.save_model(args.output_dir)
         wandb.finish()
+        return
+
+    pretrained_checkpoint = wm_checkpoint or find_last_checkpoint(wm_output_dir)
+    if pretrained_checkpoint is None:
+        raise RuntimeError(
+            "Decoder mode needs a pretrained world model. "
+            "Pass --wm-checkpoint or train with --mode wm first."
+        )
+    print(f"Loading pretrained world model from: {pretrained_checkpoint}", flush=True)
+    model = WorldModel.from_pretrained(pretrained_checkpoint).to(torch.bfloat16)
 
     for param in model.parameters():
         param.requires_grad = False
@@ -331,23 +359,21 @@ def train(
         param.requires_grad = True
 
     model.encoder.eval()
-    model.encoder_projector.eval()
     model.predictor.eval()
-    model.predictor_projector.eval()
 
     decoder_args = TrainingArguments(
-        output_dir="./checkpoints/decoder",
+        output_dir=decoder_output_dir,
         num_train_epochs=1,
-        per_device_train_batch_size=args.per_device_train_batch_size * 3,
-        per_device_eval_batch_size=args.per_device_eval_batch_size * 3,
+        per_device_train_batch_size=args.per_device_train_batch_size * 2,
+        per_device_eval_batch_size=args.per_device_eval_batch_size * 2,
         learning_rate=1e-4,
         weight_decay=1e-4,
         bf16=device == "cuda",
         logging_steps=20,
         eval_strategy="steps",
-        eval_steps=1000,
+        eval_steps=2000,
         save_strategy="steps",
-        save_steps=1000,
+        save_steps=2000,
         dataloader_num_workers=args.dataloader_num_workers,
         dataloader_prefetch_factor=args.dataloader_prefetch_factor,
         dataloader_pin_memory=True,
@@ -358,26 +384,48 @@ def train(
         optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
         torch_compile=False,
     )
-    decoder_checkpoint = find_last_checkpoint(decoder_args.output_dir)
+    decoder_checkpoint = resolve_checkpoint(resume_from, decoder_args.output_dir)
     if decoder_checkpoint is not None:
         print(f"Resuming decoder from checkpoint: {decoder_checkpoint}", flush=True)
-    DecoderTrainer(
+    trainer = DecoderTrainer(
         model=model,
         args=decoder_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-    ).train(resume_from_checkpoint=decoder_checkpoint)
+    )
+    trainer.train(resume_from_checkpoint=decoder_checkpoint)
+    trainer.model.to(torch.bfloat16)
+    trainer.save_model(decoder_args.output_dir)
+    wandb.finish()
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train miniworld world model or decoder probe.")
+    parser.add_argument("--mode", choices=["wm", "decoder"], default="wm")
+    parser.add_argument("--output-root", default=os.environ.get("MINIWORLD_CHECKPOINT_DIR", "./checkpoints"))
+    parser.add_argument("--resume-from", default="auto", help="auto, none, or a checkpoint directory")
+    parser.add_argument("--wm-checkpoint", default=None, help="Pretrained WM checkpoint for --mode decoder")
+    parser.add_argument("--context-len", type=int, default=10)
+    parser.add_argument("--sequence-stride", type=int, default=1)
+    parser.add_argument("--max-eval-sequences", type=int, default=512)
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
+    cli = parse_args()
     train(
-        context_len=10,
-        config=
-        WorldModelConfig(
+        mode=cli.mode,
+        output_root=cli.output_root,
+        resume_from=cli.resume_from,
+        wm_checkpoint=cli.wm_checkpoint,
+        context_len=cli.context_len,
+        sequence_stride=cli.sequence_stride,
+        max_eval_sequences=cli.max_eval_sequences,
+        config=WorldModelConfig(
             height=240,
             width=320,
-            patch_size=16,
-            dim=480,
-            n_heads=8,
+            patch_size=20,
+            dim=380,
+            n_heads=4,
             n_blocks=3,
             ffn_mult=3,
             dropout_proba=0.1,

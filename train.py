@@ -69,7 +69,6 @@ class WMDataset(torch.utils.data.Dataset):
         samples = self.hf_dataset[start : start + self.window_len]
         frames = self._frames_to_nchw(samples["frame"])
         actions = np.asarray(samples["action"])
-
         return {
             "frames": torch.from_numpy(frames[: self.context_len]),
             "target_frame": torch.from_numpy(frames[self.context_len]),
@@ -79,7 +78,6 @@ class WMDataset(torch.utils.data.Dataset):
     def _valid_window_starts(self, episodes: np.ndarray) -> list[int]:
         if len(episodes) < self.window_len:
             return []
-
         same_episode = episodes[: 1 - self.window_len] == episodes[self.window_len - 1 :]
         return np.flatnonzero(same_episode)[:: self.sequence_stride].tolist()
 
@@ -140,10 +138,9 @@ class DecoderTrainer(Trainer):
             observations = torch.cat([frames, target_frame.unsqueeze(1)], dim=1)
             _, tokens = model.encode(observations, return_tokens=True)
         pred_tokens = model.predict(tokens[:, :-1], actions)
-        pred_sequence = torch.cat([tokens[:, :-1], pred_tokens[:, -1:]], dim=1)
 
         true_recon = model.decoder(tokens.detach(), actions)
-        pred_recon = model.decoder(pred_sequence, actions)
+        pred_recon = model.decoder(pred_tokens[:, -1:], actions[:, -1:], context_tokens=tokens[:, :1])
         loss = F.l1_loss(true_recon.float(), target_frame.float()) + F.l1_loss(pred_recon.float(), target_frame.float())
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
@@ -264,14 +261,14 @@ def train_policy_head(
         actions = batch["actions"].to(device=device, dtype=dtype)
 
         with torch.no_grad():
-            observations = torch.cat([frames, target_frame], dim=1)
-            _, tokens = model.encode(observations, return_tokens=True)
+            _, tokens = model.encode(torch.cat([frames, target_frame], dim=1), return_tokens=True)
             predicted = model.predict(tokens[:, :-1], actions)[:, :, 0].float()
-            future = tokens[:, -1:, 0].float().expand_as(predicted)
+            start = tokens[:, :1, 0].float().expand_as(predicted)
+            target = tokens[:, -1:, 0].float().expand_as(predicted)
 
         t = torch.arange(1, predicted.size(1) + 1, device=device, dtype=torch.float32)
-        y = ((predicted.size(1) - t) / predicted.size(1)).unsqueeze(0).expand(predicted.size(0), -1)
-        pred = policy(predicted, future)
+        y = (t / predicted.size(1)).unsqueeze(0).expand(predicted.size(0), -1)
+        pred = policy(start, predicted, target)
         return F.mse_loss(pred.float(), y)
 
     global_step = 0

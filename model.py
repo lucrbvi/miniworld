@@ -24,15 +24,15 @@ class Policy(nn.Module):
         super().__init__()
         dim = config.dim
         hidden = dim * 2
-        self.in_proj = nn.Linear(dim * 4, dim)
+        self.in_proj = nn.Linear(dim * 6, dim)
         self.norm1 = nn.LayerNorm(dim)
         self.mlp1 = MLP(dim, hidden_dim=hidden, dropout=config.dropout_proba)
         self.norm2 = nn.LayerNorm(dim)
         self.mlp2 = MLP(dim, hidden_dim=hidden, dropout=config.dropout_proba)
         self.out_proj = nn.Linear(dim, 1)
 
-    def forward(self, current: Tensor, future: Tensor) -> Tensor:
-        x = torch.cat([current, future, future - current, current * future], dim=-1)
+    def forward(self, start: Tensor, current: Tensor, target: Tensor) -> Tensor:
+        x = torch.cat([start, current, target, current - start, target - current, current * target], dim=-1)
         x = self.in_proj(x)
         x = x + self.mlp1(self.norm1(x))
         x = x + self.mlp2(self.norm2(x))
@@ -164,15 +164,21 @@ class Decoder(nn.Module):
         self.norm = nn.LayerNorm(config.dim)
         self.to_patch = nn.Linear(config.dim, patch_dim)
 
-    def forward(self, tokens: Tensor, actions: Tensor | None = None) -> Tensor:
+    def forward(self, tokens: Tensor, actions: Tensor | None = None, context_tokens: Tensor | None = None) -> Tensor:
         if tokens.dim() == 3:
             tokens = tokens.unsqueeze(1)
-        patches_memory = tokens[:, :, 1:]
-        b, t, n, d = patches_memory.shape
-        memory = patches_memory.reshape(b, t * n, d)
-        if memory.size(1) > self.memory_pos.size(1):
-            raise ValueError(f"Decoder memory too long: {memory.size(1)} > {self.memory_pos.size(1)}")
-        memory = memory + self.memory_pos[:, : memory.size(1)]
+        b, t, n, d = tokens.shape
+        memory = tokens.reshape(b, t * n, d)
+        if context_tokens is not None:
+            if context_tokens.dim() == 3:
+                context_tokens = context_tokens.unsqueeze(1)
+            context_patches = context_tokens[:, :, 1:].reshape(context_tokens.size(0), -1, d)
+            memory = torch.cat([context_patches.to(dtype=tokens.dtype), memory], dim=1)
+        pos = self.memory_pos
+        if memory.size(1) > pos.size(1):
+            repeats = (memory.size(1) + pos.size(1) - 1) // pos.size(1)
+            pos = pos.repeat(1, repeats, 1)
+        memory = memory + pos[:, : memory.size(1)]
         if actions is not None:
             if actions.dim() == 2:
                 actions = actions.unsqueeze(1)
@@ -254,4 +260,4 @@ class WorldModel(PreTrainedModel):
             return self.predict(tokens, actions)
         _, tokens = self.encode(frames, return_tokens=True)
         pred_tokens = self.predict(tokens, actions)
-        return pred_tokens[:, :, 0], self.decoder(pred_tokens, actions)
+        return pred_tokens[:, :, 0], self.decoder(pred_tokens, actions, context_tokens=tokens[:, :1])

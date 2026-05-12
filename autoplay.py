@@ -45,10 +45,10 @@ def plan(model: WorldModel, policy: Policy | None, token_history: torch.Tensor, 
                 imagined.append(pred[:, 0])
                 tokens = torch.cat([tokens, pred.unsqueeze(1)], dim=1)
             imagined = torch.stack(imagined, dim=1)
-            current, goal = token_history[:, -1, 0], target[:, 0].unsqueeze(1).expand_as(imagined)
+            current, start, goal = token_history[:, -1, 0], token_history[:, :1, 0].expand_as(imagined), target[:, 0].unsqueeze(1).expand_as(imagined)
             reward = -F.mse_loss(imagined.float(), goal.float())
             if policy is not None and args.policy_weight:
-                reward = reward + args.policy_weight * policy(imagined.reshape(-1, imagined.size(-1)), goal.reshape(-1, goal.size(-1))).mean().float()
+                reward = reward + args.policy_weight * policy(start.reshape(-1, start.size(-1)), imagined.reshape(-1, imagined.size(-1)), goal.reshape(-1, goal.size(-1))).mean().float()
             loss = -reward - args.away_weight * F.mse_loss(imagined[:, -1].float(), current.float())
         loss.backward()
         opt.step()

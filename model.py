@@ -19,6 +19,25 @@ class MLP(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return self.net(x)
 
+class Policy(nn.Module):
+    def __init__(self, config: "WorldModelConfig"):
+        super().__init__()
+        dim = config.dim
+        hidden = dim * 2
+        self.in_proj = nn.Linear(dim * 4, dim)
+        self.norm1 = nn.LayerNorm(dim)
+        self.mlp1 = MLP(dim, hidden_dim=hidden, dropout=config.dropout_proba)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp2 = MLP(dim, hidden_dim=hidden, dropout=config.dropout_proba)
+        self.out_proj = nn.Linear(dim, 1)
+
+    def forward(self, current: Tensor, future: Tensor) -> Tensor:
+        x = torch.cat([current, future, future - current, current * future], dim=-1)
+        x = self.in_proj(x)
+        x = x + self.mlp1(self.norm1(x))
+        x = x + self.mlp2(self.norm2(x))
+        return torch.sigmoid(self.out_proj(x)).squeeze(-1)
+
 class TransformerBlock(nn.Module):
     def __init__(self, dim: int, n_heads: int, ffn_mult: int = 4, dropout: float = 0.0, causal: bool = False):
         super().__init__()
@@ -55,8 +74,6 @@ class TransformerStack(nn.Module):
         return self.norm(x)
 
 class CrossAttentionBlock(nn.Module):
-    """Decoder block: learned patch queries cross-attend to the CLS"""
-
     def __init__(self, dim: int, n_heads: int, ffn_mult: int = 4, dropout: float = 0.0):
         super().__init__()
         self.q_norm = nn.LayerNorm(dim)
@@ -106,7 +123,7 @@ class Predictor(nn.Module):
         self.action_proj = nn.Linear(config.action_dim, config.dim)
         self.cls_token = nn.Parameter(torch.randn(1, 1, 1, config.dim) * 0.02)
         self.time_pos = nn.Parameter(torch.randn(1, config.max_seq_len, 1, config.dim) * 0.02)
-        self.kind_pos = nn.Parameter(torch.randn(1, 1, 2, config.dim) * 0.02)  # CLS vs image/action tokens
+        self.kind_pos = nn.Parameter(torch.randn(1, 1, 2, config.dim) * 0.02)
         self.blocks = TransformerStack(config.dim, config.n_heads, config.n_blocks, config.ffn_mult, config.dropout_proba, causal=config.causal)
         self.projector = Projector(config.dim)
 
@@ -126,7 +143,7 @@ class Predictor(nn.Module):
         cls = self.cls_token.expand(b, t, 1, d) + self.time_pos[:, :t] + self.kind_pos[:, :, 0:1]
         seq = torch.cat([cls, image_tokens], dim=2).reshape(b, t * (n + 1), d)
         seq = self.projector(self.blocks(seq)).view(b, t, n + 1, d)
-        return seq[:, :, :n]  # same shape/order as encoder tokens; index 0 is the predicted CLS
+        return seq[:, :, :n]
 
 class Decoder(nn.Module):
     def __init__(self, config: "WorldModelConfig"):
@@ -150,7 +167,7 @@ class Decoder(nn.Module):
     def forward(self, tokens: Tensor, actions: Tensor | None = None) -> Tensor:
         if tokens.dim() == 3:
             tokens = tokens.unsqueeze(1)
-        patches_memory = tokens[:, :, 1:]  # all image patches from the whole context/prediction sequence
+        patches_memory = tokens[:, :, 1:]
         b, t, n, d = patches_memory.shape
         memory = patches_memory.reshape(b, t * n, d)
         if memory.size(1) > self.memory_pos.size(1):
@@ -203,7 +220,6 @@ class WorldModelConfig(PretrainedConfig):
         self.action_dim = action_dim
         self.max_seq_len = max_seq_len
 
-
 class WorldModel(PreTrainedModel):
     config_class = WorldModelConfig
     all_tied_weights_keys = {}
@@ -216,6 +232,7 @@ class WorldModel(PreTrainedModel):
         self.encoder = ViTEncoder(config)
         self.predictor = Predictor(config)
         self.decoder = Decoder(config)
+        self.policy = Policy(config)
 
     def encode(self, frames: Tensor, return_tokens: bool = False):
         if frames.dim() == 4:

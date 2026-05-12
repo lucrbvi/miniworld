@@ -9,18 +9,33 @@ import torch
 import torch.nn.functional as F
 import wandb
 from datasets import Dataset as HFDataset, load_dataset
+from safetensors.torch import save_file
 from transformers import Trainer, TrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
 
 from model import WorldModel, WorldModelConfig
 
+WANDB_PROJECT = "miniworld-wm"
+
+def setup_wandb() -> None:
+    os.environ.setdefault("WANDB_PROJECT", WANDB_PROJECT)
+
+def finish_wandb() -> None:
+    if wandb.run is not None:
+        wandb.finish()
+
+def start_wandb_run(name: str, config: dict | None = None) -> None:
+    finish_wandb()
+    wandb.init(project=os.environ.get("WANDB_PROJECT", WANDB_PROJECT), name=name, config=config)
+
+def log_metrics(metrics: dict, step: int | None = None) -> None:
+    if wandb.run is not None:
+        wandb.log(metrics, step=step)
 
 def find_last_checkpoint(path: str) -> str | None:
     return get_last_checkpoint(path) if os.path.isdir(path) else None
 
 class WMDataset(torch.utils.data.Dataset):
-    """Contiguous frame windows for next-latent prediction."""
-
     def __init__(
         self,
         hf_dataset: HFDataset,
@@ -211,7 +226,6 @@ def device_name() -> str:
         return "mps"
     return "cpu"
 
-
 def resolve_checkpoint(resume_from: str | None, output_dir: str) -> str | None:
     if resume_from is None or resume_from == "none":
         return None
@@ -220,6 +234,73 @@ def resolve_checkpoint(resume_from: str | None, output_dir: str) -> str | None:
     if not os.path.isdir(resume_from):
         raise FileNotFoundError(f"Checkpoint not found: {resume_from}")
     return resume_from
+
+def train_policy_head(
+    model: WorldModel,
+    train_dataset,
+    eval_dataset,
+    output_dir: str,
+    device: str,
+    batch_size: int,
+    epochs: int = 1,
+    lr: float = 1e-4,
+    logging_steps: int = 20,
+):
+    os.makedirs(output_dir, exist_ok=True)
+    start_wandb_run("reward-policy", {"lr": lr, "batch_size": batch_size, "epochs": epochs})
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+
+    policy = model.policy.to(device)
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    eval_loader = torch.utils.data.DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+
+    def batch_loss(batch) -> torch.Tensor:
+        dtype = next(model.parameters()).dtype
+        frames = batch["frames"].to(device=device, dtype=dtype) / 255.0
+        target_frame = batch["target_frame"].to(device=device, dtype=dtype).unsqueeze(1) / 255.0
+        actions = batch["actions"].to(device=device, dtype=dtype)
+
+        with torch.no_grad():
+            observations = torch.cat([frames, target_frame], dim=1)
+            _, tokens = model.encode(observations, return_tokens=True)
+            predicted = model.predict(tokens[:, :-1], actions)[:, :, 0].float()
+            future = tokens[:, -1:, 0].float().expand_as(predicted)
+
+        t = torch.arange(1, predicted.size(1) + 1, device=device, dtype=torch.float32)
+        y = ((predicted.size(1) - t) / predicted.size(1)).unsqueeze(0).expand(predicted.size(0), -1)
+        pred = policy(predicted, future)
+        return F.mse_loss(pred.float(), y)
+
+    global_step = 0
+    for epoch in range(epochs):
+        policy.train()
+        for batch in train_loader:
+            loss = batch_loss(batch)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            optimizer.step()
+            if global_step % logging_steps == 0:
+                log_metrics({"policy/loss": loss.detach().cpu().item(), "policy/epoch": epoch}, step=global_step)
+                print(f"policy step={global_step} loss={loss.detach().cpu().item():.4f}", flush=True)
+            global_step += 1
+
+        policy.eval()
+        losses = []
+        with torch.no_grad():
+            for batch in eval_loader:
+                losses.append(batch_loss(batch).detach().cpu())
+        eval_loss = torch.stack(losses).mean().item() if losses else float("nan")
+        log_metrics({"policy/eval_loss": eval_loss}, step=global_step)
+        print(f"policy eval epoch={epoch} loss={eval_loss:.4f}", flush=True)
+
+    save_file(policy.state_dict(), os.path.join(output_dir, "policy.safetensors"))
+    model.save_pretrained(output_dir)
+    print(f"Saved policy to {output_dir} (policy.safetensors and model.safetensors)", flush=True)
+    finish_wandb()
 
 def train(
     config: WorldModelConfig,
@@ -231,8 +312,8 @@ def train(
     sequence_stride: int = 1,
     max_eval_sequences: int = 2048,
 ):
-    if mode not in {"wm", "decoder"}:
-        raise ValueError("mode must be 'wm' or 'decoder'")
+    if mode not in {"wm", "decoder", "policy"}:
+        raise ValueError("mode must be 'wm', 'decoder' or 'policy'")
     device = device_name()
     if device == "cuda":
         torch.set_float32_matmul_precision("high")
@@ -274,7 +355,7 @@ def train(
         flush=True,
     )
 
-    os.environ.setdefault("WANDB_PROJECT", "miniworld-wm")
+    setup_wandb()
     os.makedirs(output_root, exist_ok=True)
 
     model = WorldModel(config).to(torch.bfloat16)
@@ -282,6 +363,7 @@ def train(
 
     wm_output_dir = os.path.join(output_root, "world-model")
     decoder_output_dir = os.path.join(output_root, "decoder")
+    policy_output_dir = os.path.join(output_root, "policy")
 
     args = TrainingArguments(
         output_dir=wm_output_dir,
@@ -354,17 +436,36 @@ def train(
         trainer.train(resume_from_checkpoint=last_checkpoint)
         trainer.model.to(torch.bfloat16)
         trainer.save_model(args.output_dir)
-        wandb.finish()
+        finish_wandb()
+        train_policy_head(
+            model=trainer.model,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            output_dir=policy_output_dir,
+            device=device,
+            batch_size=args.per_device_train_batch_size,
+        )
         return
 
     pretrained_checkpoint = wm_checkpoint or find_last_checkpoint(wm_output_dir)
     if pretrained_checkpoint is None:
         raise RuntimeError(
-            "Decoder mode needs a pretrained world model. "
+            f"{mode.capitalize()} mode needs a pretrained world model. "
             "Pass --wm-checkpoint or train with --mode wm first."
         )
     print(f"Loading pretrained world model from: {pretrained_checkpoint}", flush=True)
     model = WorldModel.from_pretrained(pretrained_checkpoint, ignore_mismatched_sizes=True).to(torch.bfloat16)
+
+    if mode == "policy":
+        train_policy_head(
+            model=model,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            output_dir=policy_output_dir,
+            device=device,
+            batch_size=args.per_device_train_batch_size,
+        )
+        return
 
     for param in model.parameters():
         param.requires_grad = False
@@ -409,11 +510,11 @@ def train(
     trainer.train(resume_from_checkpoint=decoder_checkpoint)
     trainer.model.to(torch.bfloat16)
     trainer.save_model(decoder_args.output_dir)
-    wandb.finish()
+    finish_wandb()
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train miniworld world model or decoder probe.")
-    parser.add_argument("--mode", choices=["wm", "decoder"], default="wm")
+    parser = argparse.ArgumentParser(description="Train miniworld world model, decoder probe, or reward policy.")
+    parser.add_argument("--mode", choices=["wm", "decoder", "policy"], default="wm")
     parser.add_argument("--output-root", default=os.environ.get("MINIWORLD_CHECKPOINT_DIR", "./checkpoints"))
     parser.add_argument("--resume-from", default="auto", help="auto, none, or a checkpoint directory")
     parser.add_argument("--wm-checkpoint", default=None, help="Pretrained WM checkpoint for --mode decoder")
@@ -421,7 +522,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sequence-stride", type=int, default=1)
     parser.add_argument("--max-eval-sequences", type=int, default=512)
     return parser.parse_args()
-
 
 if __name__ == "__main__":
     cli = parse_args()

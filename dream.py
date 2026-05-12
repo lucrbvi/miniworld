@@ -65,7 +65,6 @@ def config_for_checkpoint(model_path: str, state_dict: dict[str, torch.Tensor]) 
     config.causal = True
     return config
 
-
 def infer_image_size(n_patches: int, patch_size: int) -> tuple[int, int]:
     best_h, best_w = 1, n_patches
     target_ratio = 4 / 3
@@ -89,15 +88,15 @@ def load_state_dict_checked(model: WorldModel, state_dict: dict[str, torch.Tenso
     except RuntimeError as exc:
         filtered = {k: v for k, v in state_dict.items() if not k.startswith("decoder.")}
         result = model.load_state_dict(filtered, strict=False)
-        bad_missing = [k for k in result.missing_keys if not k.startswith("decoder.")]
-        bad_unexpected = [k for k in result.unexpected_keys if not k.startswith("decoder.")]
+        optional_prefixes = ("decoder.", "policy.")
+        bad_missing = [k for k in result.missing_keys if not k.startswith(optional_prefixes)]
+        bad_unexpected = [k for k in result.unexpected_keys if not k.startswith(optional_prefixes)]
         if bad_missing or bad_unexpected:
             sample_keys = ", ".join(list(state_dict.keys())[:8])
             raise RuntimeError(
                 f"Checkpoint {source!r} is not compatible with the WorldModel defined in model.py. "
                 f"First checkpoint keys: {sample_keys}"
             ) from exc
-
 
 def load_world_model(model_path: str, device: str) -> WorldModel:
     if os.path.isdir(model_path):
@@ -191,13 +190,11 @@ def autocast_context(device: str, enabled: bool):
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return nullcontext()
 
-
 @torch.inference_mode()
 def encode_frame(model: WorldModel, frame: torch.Tensor, device: str, amp: bool) -> torch.Tensor:
     with autocast_context(device, amp):
         _, tokens = model.encode(frame.unsqueeze(0).unsqueeze(0), return_tokens=True)
     return tokens[:, 0]
-
 
 @torch.inference_mode()
 def predict_next_frame(
@@ -212,9 +209,10 @@ def predict_next_frame(
     action_tensor = torch.tensor(actions, device=device, dtype=torch.float32).unsqueeze(0)
     with autocast_context(device, amp):
         next_tokens = model.predict(token_history, action_tensor)[:, -1]
-        pixel_pred = model.decoder(next_tokens[:, 0])[0]
+        pred_sequence = torch.cat([token_history, next_tokens.unsqueeze(1)], dim=1)
+        pixel_pred = model.decoder(pred_sequence, action_tensor)[0]
 
-    token_history = torch.cat([token_history, next_tokens.unsqueeze(1)], dim=1)
+    token_history = pred_sequence
     if token_history.size(1) > max_context_len:
         token_history = token_history[:, -max_context_len:]
         actions = actions[-max_context_len + 1 :]
@@ -278,9 +276,7 @@ def run(args: argparse.Namespace) -> None:
         rl.close_window()
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Play with a trained DOOM world model through a raylib UI."
-    )
+    parser = argparse.ArgumentParser(description="Play with a trained DOOM world model through a raylib UI.")
     parser.add_argument("--model", default="./checkpoints", help="Checkpoint directory or .safetensors file")
     parser.add_argument("--frame", help="Initial DOOM frame image")
     parser.add_argument("--context-len", type=int, default=10)

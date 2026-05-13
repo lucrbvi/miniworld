@@ -145,8 +145,8 @@ def frame_to_tensor(frame: np.ndarray, device: str) -> torch.Tensor:
     return torch.from_numpy(chw).to(device=device, dtype=torch.float32) / 255.0
 
 def tensor_to_frame(tensor: torch.Tensor) -> np.ndarray:
-    frame = tensor.detach().clamp(0, 1).mul(255).byte().cpu().numpy()
-    return np.transpose(frame, (1, 2, 0)).copy()
+    frame = tensor.mul(255).byte().cpu().numpy()
+    return np.ascontiguousarray(np.transpose(frame, (1, 2, 0)))
 
 def build_action() -> list[float]:
     action = [0.0] * len(ACTION_NAMES)
@@ -174,9 +174,9 @@ def build_action() -> list[float]:
 
 def make_texture(frame: np.ndarray) -> rl.Texture:
     data = io.BytesIO()
-    Image.fromarray(frame).save(data, format="PNG")
-    png = data.getvalue()
-    ray_image = rl.load_image_from_memory(".png", png, len(png))
+    Image.fromarray(frame).save(data, format="BMP")
+    raw = data.getvalue()
+    ray_image = rl.load_image_from_memory(".bmp", raw, len(raw))
     texture = rl.load_texture_from_image(ray_image)
     rl.unload_image(ray_image)
     return texture
@@ -185,14 +185,14 @@ def replace_texture(texture: rl.Texture, frame: np.ndarray) -> rl.Texture:
     rl.unload_texture(texture)
     return make_texture(frame)
 
-def autocast_context(device: str, enabled: bool):
-    if enabled and device == "cuda":
+def autocast_context(device: str, enabled: bool, is_half: bool = False):
+    if enabled and device == "cuda" and not is_half:
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return nullcontext()
 
 @torch.inference_mode()
 def encode_frame(model: WorldModel, frame: torch.Tensor, device: str, amp: bool) -> torch.Tensor:
-    with autocast_context(device, amp):
+    with autocast_context(device, amp, frame.dtype == torch.float16):
         _, tokens = model.encode(frame.unsqueeze(0).unsqueeze(0), return_tokens=True)
     return tokens[:, 0]
 
@@ -200,20 +200,25 @@ def encode_frame(model: WorldModel, frame: torch.Tensor, device: str, amp: bool)
 def predict_next_frame(
     model: WorldModel,
     token_history: torch.Tensor,
-    actions: list[list[float]],
+    actions: list[list[float]] | torch.Tensor,
     max_context_len: int,
     device: str,
     amp: bool,
-) -> tuple[torch.Tensor, torch.Tensor, list[list[float]]]:
-    actions = actions[-token_history.size(1) :]
-    action_tensor = torch.tensor(actions, device=device, dtype=torch.float32).unsqueeze(0)
-    with autocast_context(device, amp):
+) -> tuple[torch.Tensor, torch.Tensor, list[list[float]] | torch.Tensor]:
+    if isinstance(actions, list):
+        actions = actions[-token_history.size(1) :]
+        action_tensor = torch.tensor(actions, device=device, dtype=token_history.dtype).unsqueeze(0)
+    else:
+        action_tensor = actions
+    with autocast_context(device, amp, token_history.dtype == torch.float16):
         next_tokens = model.predict(token_history, action_tensor)[:, -1]
         pixel_pred = model.decoder(next_tokens.unsqueeze(1), action_tensor[:, -1:], context_tokens=token_history[:, -1:])[0]
 
-    token_history = torch.cat([token_history, next_tokens.unsqueeze(1)], dim=1)
-    if token_history.size(1) > max_context_len:
-        token_history = token_history[:, -max_context_len:]
+    next_tok = next_tokens.unsqueeze(1)
+    if token_history.size(1) < max_context_len:
+        token_history = torch.cat([token_history, next_tok], dim=1)
+    else:
+        token_history = torch.cat([token_history[:, 1:], next_tok], dim=1)
         actions = actions[-max_context_len + 1 :]
     return pixel_pred, token_history, actions
 
@@ -225,14 +230,20 @@ def draw_ui(action: list[float], fps: float, generated_count: int) -> None:
     rl.draw_text(f"Inputs: {', '.join(active) if active else 'none'}", 10, 52, 16, rl.LIGHTGRAY)
     rl.draw_text(f"Target FPS: {fps:g}", 10, 70, 14, rl.GRAY)
 
+@torch.inference_mode()
 def run(args: argparse.Namespace) -> None:
     device = args.device or get_device()
     model = load_world_model(args.model, device)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
     if args.compile:
         model = torch.compile(model)
+    if device != "cpu" and not args.fp32:
+        model = model.half()
     config = model.config
     frame = load_frame(args.frame, config.height, config.width)
-    frame_tensor = frame_to_tensor(frame, device)
+    frame_tensor = frame_to_tensor(frame, device).to(dtype=next(model.parameters()).dtype)
 
     token_history = encode_frame(model, frame_tensor, device, args.amp).unsqueeze(1)
     actions = []
@@ -284,6 +295,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=["cpu", "mps", "cuda"], default=None)
     parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable CUDA bf16 autocast")
     parser.add_argument("--compile", action="store_true", help="Use torch.compile for the model")
+    parser.add_argument("--fp32", action="store_true", help="Use float32 precision instead of float16")
     parser.set_defaults(amp=True)
     args = parser.parse_args()
 

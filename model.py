@@ -238,7 +238,6 @@ class WorldModel(PreTrainedModel):
         self.encoder = ViTEncoder(config)
         self.predictor = Predictor(config)
         self.decoder = Decoder(config)
-        self.policy = Policy(config)
 
     def encode(self, frames: Tensor, return_tokens: bool = False):
         if frames.dim() == 4:

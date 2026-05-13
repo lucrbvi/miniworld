@@ -30,36 +30,76 @@ def encode(model: WorldModel, frame: np.ndarray, device: str, amp: bool) -> torc
         _, tokens = model.encode(x[None, None], return_tokens=True)
     return tokens[:, 0].float().detach().clone()
 
-def plan(model: WorldModel, policy: Policy | None, token_history: torch.Tensor, action_history: torch.Tensor, target: torch.Tensor, previous_logits: torch.Tensor | None, args: argparse.Namespace, device: str) -> tuple[list[int], torch.Tensor, float]:
-    logits = torch.randn(args.horizon, len(ACTION_NAMES), device=device) if previous_logits is None else torch.cat([previous_logits[1:].detach(), torch.randn(1, len(ACTION_NAMES), device=device)])
-    logits.requires_grad_(True)
-    opt = torch.optim.AdamW([logits], lr=args.lr)
-    loss_value = 0.0
-    for _ in range(args.iters):
-        opt.zero_grad(set_to_none=True)
-        actions, tokens, imagined = torch.sigmoid(logits), token_history, []
-        with autocast(device, args.amp):
-            for t in range(args.horizon):
-                act = torch.cat([action_history[:, :-1], actions[: t + 1].unsqueeze(0)], dim=1)
-                pred = model.predict(tokens, act.to(tokens.dtype))[:, -1]
-                imagined.append(pred[:, 0])
-                tokens = torch.cat([tokens, pred.unsqueeze(1)], dim=1)
-            imagined = torch.stack(imagined, dim=1)
-            current, start, goal = token_history[:, -1, 0], token_history[:, :1, 0].expand_as(imagined), target[:, 0].unsqueeze(1).expand_as(imagined)
-            reward = -F.mse_loss(imagined.float(), goal.float())
-            if policy is not None and args.policy_weight:
-                reward = reward + args.policy_weight * policy(start.reshape(-1, start.size(-1)), imagined.reshape(-1, imagined.size(-1)), goal.reshape(-1, goal.size(-1))).mean().float()
-            loss = -reward - args.away_weight * F.mse_loss(imagined[:, -1].float(), current.float())
-        loss.backward()
-        opt.step()
-        loss_value = float(loss.detach().cpu())
-    a = torch.sigmoid(logits[0]).detach().cpu().tolist()
+def discretize_action(values: torch.Tensor, threshold: float) -> list[int]:
+    a = values.detach().cpu().tolist()
     action = [0] * len(ACTION_NAMES)
     for i, j in ((0, 1), (2, 3), (4, 5)):
-        if max(a[i], a[j]) >= args.threshold:
+        if max(a[i], a[j]) >= threshold:
             action[i if a[i] >= a[j] else j] = 1
-    action[6:] = [int(a[i] >= args.threshold) for i in range(6, 9)]
-    return action, logits.detach().clone(), loss_value
+    action[6:] = [int(a[i] >= threshold) for i in range(6, 9)]
+    return action
+
+def load_policy(path: str, config, device: str) -> Policy:
+    policy = Policy(config)
+    if os.path.isdir(path):
+        safe = os.path.join(path, "policy.safetensors")
+        pt = os.path.join(path, "policy.pt")
+        if os.path.isfile(safe):
+            policy.load_state_dict(load_file(safe, device="cpu"))
+        elif os.path.isfile(pt):
+            policy.load_state_dict(torch.load(pt, map_location="cpu"))
+        else:
+            raise FileNotFoundError(f"Policy introuvable dans {path!r}")
+    elif os.path.isfile(path):
+        policy.load_state_dict(load_file(path, device="cpu") if path.endswith(".safetensors") else torch.load(path, map_location="cpu"))
+    else:
+        raise FileNotFoundError(f"Policy introuvable: {path!r}")
+    policy.to(device=device).eval()
+    for p in policy.parameters():
+        p.requires_grad_(False)
+    return policy
+
+def plan(model: WorldModel, policy: Policy | None, token_history: torch.Tensor, action_history: torch.Tensor, target: torch.Tensor, previous_logits: torch.Tensor | None, args: argparse.Namespace, device: str) -> tuple[list[int], torch.Tensor, float]:
+    n_actions = len(ACTION_NAMES)
+    if previous_logits is not None and previous_logits.shape == (args.candidates, args.horizon, n_actions):
+        shifted = torch.cat([previous_logits[:, 1:].detach(), torch.randn(args.candidates, 1, n_actions, device=device)], dim=1)
+        logits = shifted.clone()
+    else:
+        logits = torch.randn(args.candidates, args.horizon, n_actions, device=device)
+    logits.requires_grad_(True)
+    opt = torch.optim.AdamW([logits], lr=args.lr)
+
+    best_reward = torch.full((), -float("inf"), device=device)
+    best_idx = 0
+    for _ in range(args.iters):
+        opt.zero_grad(set_to_none=True)
+        actions = torch.sigmoid(logits)
+        tokens = token_history.expand(args.candidates, -1, -1, -1)
+        base_actions = action_history.expand(args.candidates, -1, -1)
+        rewards = []
+        with autocast(device, args.amp):
+            for t in range(args.horizon):
+                act = torch.cat([base_actions[:, :-1], actions[:, : t + 1]], dim=1)
+                act = act[:, -tokens.size(1):]
+                pred = model.predict(tokens, act.to(tokens.dtype))[:, -1]
+                current = pred[:, 0].float()
+                goal = target[:, 0].expand_as(current).float()
+                if policy is None:
+                    reward = -F.mse_loss(current, goal, reduction="none").mean(dim=-1)
+                else:
+                    start = token_history[:, 0, 0].expand_as(current).float()
+                    reward = policy(start, current, goal)
+                rewards.append(reward * (args.gamma ** t))
+                tokens = torch.cat([tokens, pred.unsqueeze(1)], dim=1)
+            returns = torch.stack(rewards, dim=1).sum(dim=1)
+            loss = -returns.mean()
+        loss.backward()
+        opt.step()
+        best_reward, best_idx_tensor = returns.detach().max(dim=0)
+        best_idx = int(best_idx_tensor.cpu())
+
+    first_action = torch.sigmoid(logits.detach()[best_idx, 0])
+    return discretize_action(first_action, args.threshold), logits.detach().clone(), float(best_reward.cpu())
 
 def run(args: argparse.Namespace) -> None:
     load_dotenv()
@@ -70,30 +110,7 @@ def run(args: argparse.Namespace) -> None:
         p.requires_grad_(False)
     cfg = model.config
     target = encode(model, load_frame(args.target_frame, cfg.height, cfg.width), device, args.amp)
-    policy = None
-    if args.policy != "none":
-        policy = model.policy
-        if args.policy != "embedded":
-            if os.path.isdir(args.policy):
-                safe, pt, full = (os.path.join(args.policy, n) for n in ("policy.safetensors", "policy.pt", "model.safetensors"))
-                if os.path.isfile(safe):
-                    policy.load_state_dict(load_file(safe, device="cpu"))
-                elif os.path.isfile(pt):
-                    policy.load_state_dict(torch.load(pt, map_location="cpu"))
-                elif os.path.isfile(full):
-                    policy.load_state_dict(WorldModel.from_pretrained(args.policy).policy.state_dict())
-                else:
-                    print(f"Policy introuvable dans {args.policy!r}; autoplay sans policy.", flush=True)
-                    policy = None
-            elif os.path.isfile(args.policy):
-                policy.load_state_dict(load_file(args.policy, device="cpu") if args.policy.endswith(".safetensors") else torch.load(args.policy, map_location="cpu"))
-            else:
-                print(f"Policy introuvable: {args.policy!r}; autoplay sans policy.", flush=True)
-                policy = None
-        if policy is not None:
-            policy.to(device).eval()
-            for p in policy.parameters():
-                p.requires_grad_(False)
+    policy = load_policy(args.policy, model.config, device) if args.policy else None
     game = vzd.DoomGame()
     if args.wad:
         game.set_doom_game_path(args.wad)
@@ -116,9 +133,6 @@ def run(args: argparse.Namespace) -> None:
         step = 0
         while not game.is_episode_finished() and step < args.max_steps:
             state = game.get_state()
-            if state is None:
-                game.make_action([0] * len(ACTION_NAMES), args.frame_skip)
-                continue
             raw = state.screen_buffer
             if args.record:
                 if video is None:
@@ -134,14 +148,20 @@ def run(args: argparse.Namespace) -> None:
             current = encode(model, frame, device, args.amp)
             token_history = current.unsqueeze(1) if token_history is None else torch.cat([token_history, current.unsqueeze(1)], dim=1)
             action_history.append([0] * len(ACTION_NAMES))
-            token_history, action_history = token_history[:, -args.context_len:], action_history[-token_history.size(1):]
+            token_history = token_history[:, -args.context_len:]
+            action_history = action_history[-token_history.size(1):]
             action_tensor = torch.tensor(action_history, device=device, dtype=torch.float32).unsqueeze(0)
-            action, last_plan, loss = plan(model, policy, token_history, action_tensor, target, last_plan, args, device)
+            action, last_plan, reward = plan(model, policy, token_history, action_tensor, target, last_plan, args, device)
             action_history[-1] = action
             game.make_action(action, args.frame_skip)
             if args.log_every and step % args.log_every == 0:
                 active = [name for name, value in zip(ACTION_NAMES, action) if value]
-                print(f"step={step:05d} loss={loss:.4f} action={active or ['none']}", flush=True)
+                avg_reward = reward / args.horizon
+                print(
+                    f"step={step:05d} reward_sum={reward:.4f} "
+                    f"reward_avg={avg_reward:.4f} action={active or ['none']}",
+                    flush=True,
+                )
             step += 1
     finally:
         if video is not None:
@@ -159,12 +179,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scale", type=int, default=2)
     parser.add_argument("--context-len", type=int, default=4)
     parser.add_argument("--horizon", type=int, default=3)
-    parser.add_argument("--iters", type=int, default=3)
+    parser.add_argument("--iters", type=int, default=8, help="Grad-MPC optimization iterations I")
+    parser.add_argument("--candidates", type=int, default=32, help="Grad-MPC candidate action sequences J")
     parser.add_argument("--lr", type=float, default=0.25)
     parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--away-weight", type=float, default=0.2, help="Encourage predicted latent to move away from current latent")
-    parser.add_argument("--policy", default="./checkpoints/policy", help="Policy dir/.safetensors/.pt, 'embedded', or 'none'")
-    parser.add_argument("--policy-weight", type=float, default=0.6, help="Weight of learned policy/value score in Grad-MPC objective")
+    parser.add_argument("--gamma", type=float, default=0.99, help="Reward discount inside Grad-MPC")
+    parser.add_argument("--policy", default=None, help="Optional external reward policy dir/.safetensors/.pt")
     parser.add_argument("--frame-skip", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--log-every", type=int, default=1)
@@ -179,8 +199,10 @@ def parse_args() -> argparse.Namespace:
         raise FileNotFoundError(args.target_frame)
     if args.wad is not None and not Path(args.wad).is_file():
         raise FileNotFoundError(args.wad)
-    if min(args.context_len, args.horizon, args.iters, args.frame_skip, args.scale) < 1:
-        raise ValueError("context-len, horizon, iters, frame-skip and scale must be >= 1")
+    if min(args.context_len, args.horizon, args.iters, args.candidates, args.frame_skip, args.scale) < 1:
+        raise ValueError("context-len, horizon, iters, candidates, frame-skip and scale must be >= 1")
+    if not 0 <= args.gamma <= 1:
+        raise ValueError("gamma must be in [0, 1]")
     return args
 
 if __name__ == "__main__":

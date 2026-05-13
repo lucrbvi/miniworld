@@ -13,7 +13,7 @@ from safetensors.torch import save_file
 from transformers import Trainer, TrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
 
-from model import WorldModel, WorldModelConfig
+from model import Policy, WorldModel, WorldModelConfig
 
 WANDB_PROJECT = "miniworld-wm"
 
@@ -107,12 +107,15 @@ class WMDataset(torch.utils.data.Dataset):
 class DecoderTrainer(Trainer):
     def create_optimizer(self):
         if self.optimizer is None:
-            low_lr = self.args.learning_rate * 0.1
+            predictor_lr = self.args.learning_rate * 0.1
+            encoder_lr = predictor_lr * 0.1
             self.optimizer = torch.optim.AdamW(
                 [
                     {"params": [p for p in self.model.decoder.parameters() if p.requires_grad], "lr": self.args.learning_rate},
-                    {"params": [p for p in self.model.predictor.projector.parameters() if p.requires_grad], "lr": low_lr},
-                    {"params": [p for p in self.model.predictor.blocks.blocks[-1].parameters() if p.requires_grad], "lr": low_lr},
+                    {"params": [p for p in self.model.predictor.projector.parameters() if p.requires_grad], "lr": predictor_lr},
+                    {"params": [p for p in self.model.predictor.blocks.blocks[-1].parameters() if p.requires_grad], "lr": predictor_lr},
+                    {"params": [p for p in self.model.encoder.projector.parameters() if p.requires_grad], "lr": encoder_lr},
+                    {"params": [p for p in self.model.encoder.blocks.blocks[-1].parameters() if p.requires_grad], "lr": encoder_lr},
                 ],
                 weight_decay=self.args.weight_decay,
             )
@@ -232,72 +235,101 @@ def resolve_checkpoint(resume_from: str | None, output_dir: str) -> str | None:
         raise FileNotFoundError(f"Checkpoint not found: {resume_from}")
     return resume_from
 
-def train_policy_head(
-    model: WorldModel,
-    train_dataset,
-    eval_dataset,
-    output_dir: str,
-    device: str,
-    batch_size: int,
-    epochs: int = 1,
-    lr: float = 1e-4,
-    logging_steps: int = 20,
-):
-    os.makedirs(output_dir, exist_ok=True)
-    start_wandb_run("reward-policy", {"lr": lr, "batch_size": batch_size, "epochs": epochs})
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad = False
+class RewardPolicyTrainer:
+    def __init__(
+        self,
+        model: WorldModel,
+        train_dataset,
+        eval_dataset,
+        output_dir: str,
+        device: str,
+        batch_size: int,
+        epochs: int = 1,
+        lr: float = 1e-4,
+        logging_steps: int = 20,
+    ):
+        self.model = model.eval()
+        self.output_dir = output_dir
+        self.device = device
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.lr = lr
+        self.logging_steps = logging_steps
+        for p in self.model.parameters():
+            p.requires_grad = False
+        # External reward policy, kept in fp32 while frozen WM runs in bf16.
+        self.policy = Policy(model.config).to(device=device)
+        self.optimizer = torch.optim.AdamW(self.policy.parameters(), lr=lr, weight_decay=1e-4)
+        self.train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+        self.eval_loader = torch.utils.data.DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+        self.global_step = 0
 
-    policy = model.policy.to(device)
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    eval_loader = torch.utils.data.DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-
-    def batch_loss(batch) -> torch.Tensor:
-        dtype = next(model.parameters()).dtype
-        frames = batch["frames"].to(device=device, dtype=dtype) / 255.0
-        target_frame = batch["target_frame"].to(device=device, dtype=dtype).unsqueeze(1) / 255.0
-        actions = batch["actions"].to(device=device, dtype=dtype)
-
+    def batch_loss(self, batch) -> torch.Tensor:
+        dtype = next(self.model.parameters()).dtype
+        frames = batch["frames"].to(device=self.device, dtype=dtype) / 255.0
+        target_frame = batch["target_frame"].to(device=self.device, dtype=dtype).unsqueeze(1) / 255.0
+        actions = batch["actions"].to(device=self.device, dtype=dtype)
         with torch.no_grad():
-            _, tokens = model.encode(torch.cat([frames, target_frame], dim=1), return_tokens=True)
-            predicted = model.predict(tokens[:, :-1], actions)[:, :, 0].float()
+            _, tokens = self.model.encode(torch.cat([frames, target_frame], dim=1), return_tokens=True)
+            predicted = self.model.predict(tokens[:, :-1], actions)[:, :, 0].float()
             start = tokens[:, :1, 0].float().expand_as(predicted)
             target = tokens[:, -1:, 0].float().expand_as(predicted)
+        distances = torch.linalg.vector_norm(predicted - target, dim=-1)
+        max_distance = distances.amax(dim=1, keepdim=True).clamp_min(1e-6)
+        y = 1.0 - (distances / max_distance)
+        pred = self.policy(start, predicted, target)
+        loss = F.mse_loss(pred.float(), y)
+        return loss
 
-        t = torch.arange(1, predicted.size(1) + 1, device=device, dtype=torch.float32)
-        y = (t / predicted.size(1)).unsqueeze(0).expand(predicted.size(0), -1)
-        pred = policy(start, predicted, target)
-        return F.mse_loss(pred.float(), y)
+    def log(self, metrics: dict) -> None:
+        log_metrics(metrics, step=self.global_step)
 
-    global_step = 0
-    for epoch in range(epochs):
-        policy.train()
-        for batch in train_loader:
-            loss = batch_loss(batch)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-            optimizer.step()
-            if global_step % logging_steps == 0:
-                log_metrics({"policy/loss": loss.detach().cpu().item(), "policy/epoch": epoch}, step=global_step)
-                print(f"policy step={global_step} loss={loss.detach().cpu().item():.4f}", flush=True)
-            global_step += 1
+    def train(self) -> Policy:
+        os.makedirs(self.output_dir, exist_ok=True)
+        start_wandb_run(
+            "reward-policy",
+            {"lr": self.lr, "batch_size": self.batch_size, "epochs": self.epochs},
+        )
+        try:
+            for epoch in range(self.epochs):
+                self.policy.train()
+                for batch in self.train_loader:
+                    loss = self.batch_loss(batch)
+                    self.optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+                    self.optimizer.step()
+                    if self.global_step % self.logging_steps == 0:
+                        loss_value = loss.detach().float().cpu().item()
+                        self.log(
+                            {
+                                "policy/train_loss": loss_value,
+                                "policy/grad_norm": float(grad_norm.detach().float().cpu()),
+                                "policy/epoch": epoch,
+                                "policy/lr": self.lr,
+                            }
+                        )
+                        print(f"policy step={self.global_step} epoch={epoch} loss={loss_value:.4f}", flush=True)
+                    self.global_step += 1
+                eval_loss = self.evaluate()
+                self.log({"policy/eval_loss": eval_loss, "policy/epoch": epoch + 1})
+                print(f"policy eval epoch={epoch} loss={eval_loss:.4f}", flush=True)
+            self.save()
+            return self.policy
+        finally:
+            finish_wandb()
 
-        policy.eval()
-        losses = []
-        with torch.no_grad():
-            for batch in eval_loader:
-                losses.append(batch_loss(batch).detach().cpu())
-        eval_loss = torch.stack(losses).mean().item() if losses else float("nan")
-        log_metrics({"policy/eval_loss": eval_loss}, step=global_step)
-        print(f"policy eval epoch={epoch} loss={eval_loss:.4f}", flush=True)
+    @torch.no_grad()
+    def evaluate(self) -> float:
+        self.policy.eval()
+        losses = [self.batch_loss(batch).detach().float().cpu() for batch in self.eval_loader]
+        return torch.stack(losses).mean().item() if losses else float("nan")
 
-    save_file(policy.state_dict(), os.path.join(output_dir, "policy.safetensors"))
-    model.save_pretrained(output_dir)
-    print(f"Saved policy to {output_dir} (policy.safetensors and model.safetensors)", flush=True)
-    finish_wandb()
+    def save(self) -> None:
+        save_file(self.policy.state_dict(), os.path.join(self.output_dir, "policy.safetensors"))
+        with open(os.path.join(self.output_dir, "policy_config.json"), "w") as f:
+            json.dump(self.model.config.to_dict(), f, indent=2)
+        print(f"Saved external policy to {self.output_dir} (policy.safetensors and policy_config.json)", flush=True)
 
 def train(
     config: WorldModelConfig,
@@ -434,14 +466,14 @@ def train(
         trainer.model.to(torch.bfloat16)
         trainer.save_model(args.output_dir)
         finish_wandb()
-        train_policy_head(
+        RewardPolicyTrainer(
             model=trainer.model,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             output_dir=policy_output_dir,
             device=device,
             batch_size=args.per_device_train_batch_size,
-        )
+        ).train()
         return
 
     pretrained_checkpoint = wm_checkpoint or find_last_checkpoint(wm_output_dir)
@@ -451,26 +483,32 @@ def train(
             "Pass --wm-checkpoint or train with --mode wm first."
         )
     print(f"Loading pretrained world model from: {pretrained_checkpoint}", flush=True)
-    model = WorldModel.from_pretrained(pretrained_checkpoint, ignore_mismatched_sizes=True).to(torch.bfloat16)
+    model = WorldModel.from_pretrained(pretrained_checkpoint, ignore_mismatched_sizes=True).to(device=device, dtype=torch.bfloat16)
 
     if mode == "policy":
-        train_policy_head(
+        RewardPolicyTrainer(
             model=model,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             output_dir=policy_output_dir,
             device=device,
-            batch_size=args.per_device_train_batch_size,
-        )
+            batch_size=args.per_device_train_batch_size * 5,
+        ).train()
         return
 
     for param in model.parameters():
         param.requires_grad = False
-    for module in (model.decoder, model.predictor.projector, model.predictor.blocks.blocks[-1]):
+    for module in (
+        model.decoder,
+        model.predictor.projector,
+        model.predictor.blocks.blocks[-1],
+        model.encoder.projector,
+        model.encoder.blocks.blocks[-1],
+    ):
         for param in module.parameters():
             param.requires_grad = True
 
-    model.encoder.eval()
+    model.encoder.train()
 
     decoder_args = TrainingArguments(
         output_dir=decoder_output_dir,

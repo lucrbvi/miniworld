@@ -164,13 +164,7 @@ class Decoder(nn.Module):
         self.norm = nn.LayerNorm(config.dim)
         self.to_patch = nn.Linear(config.dim, patch_dim)
 
-    def forward(
-        self,
-        tokens: Tensor,
-        actions: Tensor | None = None,
-        context_tokens: Tensor | None = None,
-        residual_frame: Tensor | None = None,
-    ) -> Tensor:
+    def forward(self, tokens: Tensor, actions: Tensor | None = None, context_tokens: Tensor | None = None) -> Tensor:
         if tokens.dim() == 3:
             tokens = tokens.unsqueeze(1)
         b, t, n, d = tokens.shape
@@ -197,10 +191,7 @@ class Decoder(nn.Module):
         p = self.patch_size
         img = patches.view(b, self.grid_h, self.grid_w, 3, p, p)
         img = img.permute(0, 3, 1, 4, 2, 5).contiguous()
-        delta = 0.25 * torch.tanh(img.view(b, 3, self.grid_h * p, self.grid_w * p))
-        if residual_frame is None:
-            return torch.sigmoid(delta)
-        return (residual_frame.to(dtype=delta.dtype) + delta).clamp(0.0, 1.0)
+        return torch.sigmoid(img.view(b, 3, self.grid_h * p, self.grid_w * p))
 
 class WorldModelConfig(PretrainedConfig):
     model_type = "world_model"
@@ -268,9 +259,4 @@ class WorldModel(PreTrainedModel):
             return self.predict(tokens, actions)
         _, tokens = self.encode(frames, return_tokens=True)
         pred_tokens = self.predict(tokens, actions)
-        return pred_tokens[:, :, 0], self.decoder(
-            pred_tokens,
-            actions,
-            context_tokens=tokens[:, :1],
-            residual_frame=frames[:, -1],
-        )
+        return pred_tokens[:, :, 0], self.decoder(pred_tokens, actions, context_tokens=tokens[:, :1])

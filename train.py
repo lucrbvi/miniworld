@@ -150,12 +150,10 @@ class DecoderTrainer(Trainer):
         decoder_tokens = torch.cat([tokens[:, -1:], pred_tokens[:, -1:]], dim=0)
         decoder_context_tokens = tokens[:, :-1].repeat(2, 1, 1, 1)
         decoder_actions = actions[:, -1:].repeat(2, 1, 1)
-        residual_frame = frames[:, -1].repeat(2, 1, 1, 1)
         recon = model.decoder(
             decoder_tokens,
             decoder_actions,
             context_tokens=decoder_context_tokens,
-            residual_frame=residual_frame,
         )
         true_recon, pred_recon = recon.chunk(2, dim=0)
 
@@ -167,6 +165,9 @@ class DecoderTrainer(Trainer):
         pred_recon_l1 = F.l1_loss(pred_recon_f, target_frame_f)
         true_recon_grad_loss = self.grad_loss(true_recon_f, target_frame_f)
         pred_recon_grad_loss = self.grad_loss(pred_recon_f, target_frame_f)
+        copy_frame_f = frames[:, -1].float()
+        copy_l1 = F.l1_loss(copy_frame_f, target_frame_f)
+        copy_grad_loss = self.grad_loss(copy_frame_f, target_frame_f)
         true_recon_loss = true_recon_l1 + 0.5 * true_recon_grad_loss
         pred_recon_loss = pred_recon_l1 + 0.5 * pred_recon_grad_loss
         loss = true_recon_loss + pred_recon_loss
@@ -179,8 +180,10 @@ class DecoderTrainer(Trainer):
                     "pred_recon_loss": self.scalar(pred_recon_loss),
                     "true_recon_l1": self.scalar(true_recon_l1),
                     "pred_recon_l1": self.scalar(pred_recon_l1),
+                    "copy_l1": self.scalar(copy_l1),
                     "true_recon_grad_loss": self.scalar(true_recon_grad_loss),
                     "pred_recon_grad_loss": self.scalar(pred_recon_grad_loss),
+                    "copy_grad_loss": self.scalar(copy_grad_loss),
                 }
             )
 

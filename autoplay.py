@@ -88,7 +88,7 @@ def plan(model: WorldModel, policy: Policy | None, token_history: torch.Tensor, 
                     reward = -F.mse_loss(current, goal, reduction="none").mean(dim=-1)
                 else:
                     start = token_history[:, 0, 0].expand_as(current).float()
-                    reward = policy(start, current, goal)
+                    reward = torch.sigmoid(policy(start, current, goal))
                 rewards.append(reward * (args.gamma ** t))
                 tokens = torch.cat([tokens, pred.unsqueeze(1)], dim=1)
             returns = torch.stack(rewards, dim=1).sum(dim=1)

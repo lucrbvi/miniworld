@@ -125,6 +125,12 @@ class DecoderTrainer(Trainer):
     def scalar(value: torch.Tensor) -> float:
         return value.detach().float().cpu().item()
 
+    @staticmethod
+    def grad_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        dx = F.l1_loss(x[..., :, 1:] - x[..., :, :-1], y[..., :, 1:] - y[..., :, :-1])
+        dy = F.l1_loss(x[..., 1:, :] - x[..., :-1, :], y[..., 1:, :] - y[..., :-1, :])
+        return dx + dy
+
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad(), self.compute_loss_context_manager():
@@ -137,17 +143,46 @@ class DecoderTrainer(Trainer):
         target_frame = inputs["target_frame"].to(dtype=dtype) / 255.0
         actions = inputs["actions"].to(dtype=dtype)
 
-        with torch.no_grad():
-            observations = torch.cat([frames, target_frame.unsqueeze(1)], dim=1)
-            _, tokens = model.encode(observations, return_tokens=True)
+        observations = torch.cat([frames, target_frame.unsqueeze(1)], dim=1)
+        _, tokens = model.encode(observations, return_tokens=True)
         pred_tokens = model.predict(tokens[:, :-1], actions)
 
-        true_recon = model.decoder(tokens.detach(), actions)
-        pred_recon = model.decoder(pred_tokens[:, -1:], actions[:, -1:], context_tokens=tokens[:, :1])
-        loss = F.l1_loss(true_recon.float(), target_frame.float()) + F.l1_loss(pred_recon.float(), target_frame.float())
+        decoder_tokens = torch.cat([tokens[:, -1:], pred_tokens[:, -1:]], dim=0)
+        decoder_context_tokens = tokens[:, :-1].repeat(2, 1, 1, 1)
+        decoder_actions = actions[:, -1:].repeat(2, 1, 1)
+        residual_frame = frames[:, -1].repeat(2, 1, 1, 1)
+        recon = model.decoder(
+            decoder_tokens,
+            decoder_actions,
+            context_tokens=decoder_context_tokens,
+            residual_frame=residual_frame,
+        )
+        true_recon, pred_recon = recon.chunk(2, dim=0)
+
+        target_frame_f = target_frame.float()
+        true_recon_f = true_recon.float()
+        pred_recon_f = pred_recon.float()
+
+        true_recon_l1 = F.l1_loss(true_recon_f, target_frame_f)
+        pred_recon_l1 = F.l1_loss(pred_recon_f, target_frame_f)
+        true_recon_grad_loss = self.grad_loss(true_recon_f, target_frame_f)
+        pred_recon_grad_loss = self.grad_loss(pred_recon_f, target_frame_f)
+        true_recon_loss = true_recon_l1 + 0.5 * true_recon_grad_loss
+        pred_recon_loss = pred_recon_l1 + 0.5 * pred_recon_grad_loss
+        loss = true_recon_loss + pred_recon_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
-            self.log({"decoder_loss": self.scalar(loss)})
+            self.log(
+                {
+                    "decoder_loss": self.scalar(loss),
+                    "true_recon_loss": self.scalar(true_recon_loss),
+                    "pred_recon_loss": self.scalar(pred_recon_loss),
+                    "true_recon_l1": self.scalar(true_recon_l1),
+                    "pred_recon_l1": self.scalar(pred_recon_l1),
+                    "true_recon_grad_loss": self.scalar(true_recon_grad_loss),
+                    "pred_recon_grad_loss": self.scalar(pred_recon_grad_loss),
+                }
+            )
 
         if return_outputs:
             return loss, {"true_recon": true_recon.detach(), "pred_recon": pred_recon.detach()}
@@ -235,101 +270,74 @@ def resolve_checkpoint(resume_from: str | None, output_dir: str) -> str | None:
         raise FileNotFoundError(f"Checkpoint not found: {resume_from}")
     return resume_from
 
-class RewardPolicyTrainer:
-    def __init__(
-        self,
-        model: WorldModel,
-        train_dataset,
-        eval_dataset,
-        output_dir: str,
-        device: str,
-        batch_size: int,
-        epochs: int = 1,
-        lr: float = 1e-4,
-        logging_steps: int = 20,
-    ):
-        self.model = model.eval()
-        self.output_dir = output_dir
-        self.device = device
-        self.batch_size = batch_size
-        self.epochs = epochs
-        self.lr = lr
-        self.logging_steps = logging_steps
-        for p in self.model.parameters():
+class RewardPolicyTrainer(Trainer):
+    def __init__(self, wm_model: WorldModel, *args, reward_temperature: float = 5.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.wm_model = wm_model.eval()
+        self.reward_temperature = reward_temperature
+        for p in self.wm_model.parameters():
             p.requires_grad = False
-        # External reward policy, kept in fp32 while frozen WM runs in bf16.
-        self.policy = Policy(model.config).to(device=device)
-        self.optimizer = torch.optim.AdamW(self.policy.parameters(), lr=lr, weight_decay=1e-4)
-        self.train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-        self.eval_loader = torch.utils.data.DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-        self.global_step = 0
 
-    def batch_loss(self, batch) -> torch.Tensor:
-        dtype = next(self.model.parameters()).dtype
-        frames = batch["frames"].to(device=self.device, dtype=dtype) / 255.0
-        target_frame = batch["target_frame"].to(device=self.device, dtype=dtype).unsqueeze(1) / 255.0
-        actions = batch["actions"].to(device=self.device, dtype=dtype)
+    @staticmethod
+    def scalar(value: torch.Tensor) -> float:
+        return value.detach().float().cpu().item()
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        dtype = next(self.wm_model.parameters()).dtype
+        frames = inputs["frames"].to(device=self.args.device, dtype=dtype) / 255.0
+        target_frame = inputs["target_frame"].to(device=self.args.device, dtype=dtype).unsqueeze(1) / 255.0
+        actions = inputs["actions"].to(device=self.args.device, dtype=dtype)
+
         with torch.no_grad():
-            _, tokens = self.model.encode(torch.cat([frames, target_frame], dim=1), return_tokens=True)
-            predicted = self.model.predict(tokens[:, :-1], actions)[:, :, 0].float()
+            _, tokens = self.wm_model.encode(torch.cat([frames, target_frame], dim=1), return_tokens=True)
+            predicted = self.wm_model.predict(tokens[:, :-1], actions)[:, :, 0].float()
             start = tokens[:, :1, 0].float().expand_as(predicted)
             target = tokens[:, -1:, 0].float().expand_as(predicted)
-        distances = torch.linalg.vector_norm(predicted - target, dim=-1)
-        max_distance = distances.amax(dim=1, keepdim=True).clamp_min(1e-6)
-        y = 1.0 - (distances / max_distance)
-        pred = self.policy(start, predicted, target)
-        loss = F.mse_loss(pred.float(), y)
+
+        score = model(start, predicted, target).float()
+        dist = torch.linalg.vector_norm(predicted - target, dim=-1)
+        batch_idx = torch.arange(score.size(0), device=score.device)
+        i = torch.randint(0, score.size(1), (score.size(0),), device=score.device)
+        j = torch.randint(0, score.size(1), (score.size(0),), device=score.device)
+        logits = score[batch_idx, i] - score[batch_idx, j]
+        better_i = (dist[batch_idx, i] < dist[batch_idx, j]).float()
+        ranking_loss = F.binary_cross_entropy_with_logits(logits, better_i)
+
+        # Auxiliary absolute reward keeps score calibration sane without per-sequence max normalization.
+        y = torch.exp(-dist / self.reward_temperature)
+        calibration_loss = F.binary_cross_entropy_with_logits(score, y)
+        loss = ranking_loss + 0.1 * calibration_loss
+
+        if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
+            pred_prob = torch.sigmoid(score)
+            self.log(
+                {
+                    "policy/ranking_loss": self.scalar(ranking_loss),
+                    "policy/calibration_loss": self.scalar(calibration_loss),
+                    "policy/dist_mean": self.scalar(dist.mean()),
+                    "policy/dist_std": self.scalar(dist.std()),
+                    "policy/y_mean": self.scalar(y.mean()),
+                    "policy/y_std": self.scalar(y.std()),
+                    "policy/y_min": self.scalar(y.min()),
+                    "policy/y_max": self.scalar(y.max()),
+                    "policy/pred_mean": self.scalar(pred_prob.mean()),
+                    "policy/pred_std": self.scalar(pred_prob.std()),
+                    "policy/logit_mean": self.scalar(score.mean()),
+                    "policy/logit_std": self.scalar(score.std()),
+                }
+            )
+
+        if return_outputs:
+            return loss, {"scores": score.detach(), "dist": dist.detach(), "y": y.detach()}
         return loss
 
-    def log(self, metrics: dict) -> None:
-        log_metrics(metrics, step=self.global_step)
-
-    def train(self) -> Policy:
-        os.makedirs(self.output_dir, exist_ok=True)
-        start_wandb_run(
-            "reward-policy",
-            {"lr": self.lr, "batch_size": self.batch_size, "epochs": self.epochs},
-        )
-        try:
-            for epoch in range(self.epochs):
-                self.policy.train()
-                for batch in self.train_loader:
-                    loss = self.batch_loss(batch)
-                    self.optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
-                    self.optimizer.step()
-                    if self.global_step % self.logging_steps == 0:
-                        loss_value = loss.detach().float().cpu().item()
-                        self.log(
-                            {
-                                "policy/train_loss": loss_value,
-                                "policy/grad_norm": float(grad_norm.detach().float().cpu()),
-                                "policy/epoch": epoch,
-                                "policy/lr": self.lr,
-                            }
-                        )
-                        print(f"policy step={self.global_step} epoch={epoch} loss={loss_value:.4f}", flush=True)
-                    self.global_step += 1
-                eval_loss = self.evaluate()
-                self.log({"policy/eval_loss": eval_loss, "policy/epoch": epoch + 1})
-                print(f"policy eval epoch={epoch} loss={eval_loss:.4f}", flush=True)
-            self.save()
-            return self.policy
-        finally:
-            finish_wandb()
-
-    @torch.no_grad()
-    def evaluate(self) -> float:
-        self.policy.eval()
-        losses = [self.batch_loss(batch).detach().float().cpu() for batch in self.eval_loader]
-        return torch.stack(losses).mean().item() if losses else float("nan")
-
-    def save(self) -> None:
-        save_file(self.policy.state_dict(), os.path.join(self.output_dir, "policy.safetensors"))
-        with open(os.path.join(self.output_dir, "policy_config.json"), "w") as f:
-            json.dump(self.model.config.to_dict(), f, indent=2)
-        print(f"Saved external policy to {self.output_dir} (policy.safetensors and policy_config.json)", flush=True)
+    def save_policy(self, output_dir: str | None = None) -> None:
+        output_dir = output_dir or self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        save_file(self.model.state_dict(), os.path.join(output_dir, "policy.safetensors"))
+        with open(os.path.join(output_dir, "policy_config.json"), "w") as f:
+            json.dump(self.wm_model.config.to_dict(), f, indent=2)
+        print(f"Saved external policy to {output_dir} (policy.safetensors and policy_config.json)", flush=True)
 
 def train(
     config: WorldModelConfig,
@@ -466,14 +474,39 @@ def train(
         trainer.model.to(torch.bfloat16)
         trainer.save_model(args.output_dir)
         finish_wandb()
-        RewardPolicyTrainer(
-            model=trainer.model,
+        policy_args = TrainingArguments(
+            output_dir=policy_output_dir,
+            num_train_epochs=1,
+            per_device_train_batch_size=args.per_device_train_batch_size * 4,
+            per_device_eval_batch_size=args.per_device_eval_batch_size * 4,
+            learning_rate=1e-4,
+            weight_decay=1e-4,
+            max_grad_norm=1.0,
+            bf16=device == "cuda",
+            logging_steps=20,
+            eval_strategy="steps",
+            eval_steps=500,
+            save_strategy="steps",
+            save_steps=1000,
+            dataloader_num_workers=16,
+            dataloader_prefetch_factor=4,
+            dataloader_pin_memory=True,
+            dataloader_persistent_workers=True,
+            remove_unused_columns=False,
+            report_to=["wandb"],
+            run_name="reward-policy",
+            optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
+            torch_compile=True,
+        )
+        policy_trainer = RewardPolicyTrainer(
+            wm_model=trainer.model,
+            model=Policy(trainer.model.config),
+            args=policy_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            output_dir=policy_output_dir,
-            device=device,
-            batch_size=args.per_device_train_batch_size,
-        ).train()
+        )
+        policy_trainer.train()
+        policy_trainer.save_policy(policy_args.output_dir)
         return
 
     pretrained_checkpoint = wm_checkpoint or find_last_checkpoint(wm_output_dir)
@@ -486,14 +519,39 @@ def train(
     model = WorldModel.from_pretrained(pretrained_checkpoint, ignore_mismatched_sizes=True).to(device=device, dtype=torch.bfloat16)
 
     if mode == "policy":
-        RewardPolicyTrainer(
-            model=model,
+        policy_args = TrainingArguments(
+            output_dir=policy_output_dir,
+            num_train_epochs=1,
+            per_device_train_batch_size=args.per_device_train_batch_size * 5,
+            per_device_eval_batch_size=args.per_device_eval_batch_size * 5,
+            learning_rate=1e-4,
+            weight_decay=1e-4,
+            max_grad_norm=1.0,
+            bf16=device == "cuda",
+            logging_steps=20,
+            eval_strategy="steps",
+            eval_steps=500,
+            save_strategy="steps",
+            save_steps=1000,
+            dataloader_num_workers=16,
+            dataloader_prefetch_factor=4,
+            dataloader_pin_memory=True,
+            dataloader_persistent_workers=True,
+            remove_unused_columns=False,
+            report_to=["wandb"],
+            run_name="reward-policy",
+            optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
+            torch_compile=True,
+        )
+        policy_trainer = RewardPolicyTrainer(
+            wm_model=model,
+            model=Policy(model.config),
+            args=policy_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            output_dir=policy_output_dir,
-            device=device,
-            batch_size=args.per_device_train_batch_size * 5,
-        ).train()
+        )
+        policy_trainer.train()
+        policy_trainer.save_policy(policy_args.output_dir)
         return
 
     for param in model.parameters():

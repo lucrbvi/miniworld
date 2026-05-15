@@ -108,10 +108,22 @@ class SectionedWandbTrainer(Trainer):
     wandb_section: str = ""
 
     def log(self, logs: dict[str, float], *args, **kwargs) -> None:
+        if self.state.epoch is not None and "epoch" not in logs:
+            logs["epoch"] = round(self.state.epoch, 4)
+
         if self.wandb_section:
             prefix = f"{self.wandb_section}/"
-            logs = {key if key.startswith(prefix) else f"{prefix}{key}": value for key, value in logs.items()}
-        super().log(logs, *args, **kwargs)
+            logs = {
+                key if key == "epoch" or key.startswith(prefix) else f"{prefix}{key}": value
+                for key, value in logs.items()
+            }
+
+        if wandb.run is not None:
+            wandb.log(logs, step=self.state.global_step)
+
+        output = {**logs, "step": self.state.global_step}
+        self.state.log_history.append(output)
+        self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
 
 class DecoderTrainer(SectionedWandbTrainer):
     wandb_section = "decoder"
@@ -402,7 +414,7 @@ def train(
         dataloader_pin_memory=True,
         dataloader_persistent_workers=True,
         remove_unused_columns=False,
-        report_to=["wandb"],
+        report_to=[],
         run_name="world-model",
         optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
         torch_compile=True,
@@ -446,6 +458,7 @@ def train(
         )
         if last_checkpoint is not None:
             print(f"Resuming world-model training from: {last_checkpoint}", flush=True)
+        start_wandb_run("world-model", config=config.to_dict())
         trainer.train(resume_from_checkpoint=last_checkpoint)
         trainer.model.to(torch.bfloat16)
         trainer.save_model(args.output_dir)
@@ -469,7 +482,7 @@ def train(
             dataloader_pin_memory=True,
             dataloader_persistent_workers=True,
             remove_unused_columns=False,
-            report_to=["wandb"],
+            report_to=[],
             run_name="reward-policy",
             optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
             torch_compile=True,
@@ -481,8 +494,10 @@ def train(
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
         )
+        start_wandb_run("reward-policy", config=config.to_dict())
         policy_trainer.train()
         policy_trainer.save_policy(policy_args.output_dir)
+        finish_wandb()
         return
 
     pretrained_checkpoint = wm_checkpoint or find_last_checkpoint(wm_output_dir)
@@ -514,7 +529,7 @@ def train(
             dataloader_pin_memory=True,
             dataloader_persistent_workers=True,
             remove_unused_columns=False,
-            report_to=["wandb"],
+            report_to=[],
             run_name="reward-policy",
             optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
             torch_compile=True,
@@ -526,8 +541,10 @@ def train(
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
         )
+        start_wandb_run("reward-policy", config=config.to_dict())
         policy_trainer.train()
         policy_trainer.save_policy(policy_args.output_dir)
+        finish_wandb()
         return
 
     for param in model.parameters():
@@ -556,7 +573,7 @@ def train(
         dataloader_pin_memory=True,
         dataloader_persistent_workers=True,
         remove_unused_columns=False,
-        report_to=["wandb"],
+        report_to=[],
         run_name="decoder-probe",
         optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
         torch_compile=False,
@@ -570,6 +587,7 @@ def train(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
     )
+    start_wandb_run("decoder-probe", config=config.to_dict())
     trainer.train(resume_from_checkpoint=decoder_checkpoint)
     trainer.model.to(torch.bfloat16)
     trainer.save_model(decoder_args.output_dir)

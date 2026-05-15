@@ -212,8 +212,9 @@ class WMTrainer(SectionedWandbTrainer):
         sigreg_loss = torch.stack(
             [self.sigreg(embeddings[:, t].float()) for t in range(embeddings.size(1))]
         ).mean()
-        pred_loss = F.mse_loss(pred_tokens.float(), target_tokens.float())
-        loss = pred_loss + self.sigreg_weight * sigreg_loss
+        pred_loss = F.mse_loss(pred_tokens[:, :, 0].float(), embeddings[:, 1:].float())
+        patch_loss = F.mse_loss(pred_tokens[:, :, 1:].float(), target_tokens[:, :, 1:].float())
+        loss = pred_loss + 0.1 * patch_loss + self.sigreg_weight * sigreg_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
             flat_z = embeddings.flatten(0, 1)
@@ -225,11 +226,13 @@ class WMTrainer(SectionedWandbTrainer):
                     "loss_total": self.scalar(loss),
                     "pred_loss": self.scalar(pred_loss),
                     "sigreg": self.scalar(sigreg_loss),
+                    "patch_loss_aux": self.scalar(patch_loss),
                     "z_std_mean": self.scalar(z_std.mean()),
                     "z_std_min": self.scalar(z_std.min()),
                     "z_norm_mean": self.scalar(flat_z.norm(dim=-1).mean()),
                     "pred_std": self.scalar(pred_z.std(dim=(0, 1)).mean()),
                     "target_std": self.scalar(target_z.std(dim=(0, 1)).mean()),
+                    "pred_target_std_ratio": self.scalar(pred_z.std(dim=(0, 1)).mean() / target_z.std(dim=(0, 1)).mean().clamp_min(1e-6)),
                 }
             )
 
@@ -454,7 +457,7 @@ def train(
             args=args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            sigreg_weight=0.2,
+            sigreg_weight=0.1,
         )
         if last_checkpoint is not None:
             print(f"Resuming world-model training from: {last_checkpoint}", flush=True)

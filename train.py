@@ -104,32 +104,27 @@ class WMDataset(torch.utils.data.Dataset):
             frames = np.transpose(frames, (0, 3, 1, 2))
         return np.ascontiguousarray(frames)
 
-class DecoderTrainer(Trainer):
-    def create_optimizer(self):
-        if self.optimizer is None:
-            predictor_lr = self.args.learning_rate * 0.1
-            encoder_lr = predictor_lr * 0.1
-            self.optimizer = torch.optim.AdamW(
-                [
-                    {"params": [p for p in self.model.decoder.parameters() if p.requires_grad], "lr": self.args.learning_rate},
-                    {"params": [p for p in self.model.predictor.projector.parameters() if p.requires_grad], "lr": predictor_lr},
-                    {"params": [p for p in self.model.predictor.blocks.blocks[-1].parameters() if p.requires_grad], "lr": predictor_lr},
-                    {"params": [p for p in self.model.encoder.projector.parameters() if p.requires_grad], "lr": encoder_lr},
-                    {"params": [p for p in self.model.encoder.blocks.blocks[-1].parameters() if p.requires_grad], "lr": encoder_lr},
-                ],
-                weight_decay=self.args.weight_decay,
-            )
-        return self.optimizer
+class SectionedWandbTrainer(Trainer):
+    wandb_section: str = ""
+
+    def log(self, logs: dict[str, float], *args, **kwargs) -> None:
+        if self.wandb_section:
+            prefix = f"{self.wandb_section}/"
+            logs = {key if key.startswith(prefix) else f"{prefix}{key}": value for key, value in logs.items()}
+        super().log(logs, *args, **kwargs)
+
+class DecoderTrainer(SectionedWandbTrainer):
+    wandb_section = "decoder"
 
     @staticmethod
     def scalar(value: torch.Tensor) -> float:
         return value.detach().float().cpu().item()
 
-    @staticmethod
-    def grad_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        dx = F.l1_loss(x[..., :, 1:] - x[..., :, :-1], y[..., :, 1:] - y[..., :, :-1])
-        dy = F.l1_loss(x[..., 1:, :] - x[..., :-1, :], y[..., 1:, :] - y[..., :-1, :])
-        return dx + dy
+    def curriculum_ratio(self) -> float:
+        max_steps = self.args.max_steps if self.args.max_steps and self.args.max_steps > 0 else self.state.max_steps
+        if not max_steps:
+            return 0.0
+        return min(1.0, self.state.global_step / max_steps)
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
@@ -143,55 +138,31 @@ class DecoderTrainer(Trainer):
         target_frame = inputs["target_frame"].to(dtype=dtype) / 255.0
         actions = inputs["actions"].to(dtype=dtype)
 
+        model.encoder.eval()
+        model.predictor.eval()
+
         observations = torch.cat([frames, target_frame.unsqueeze(1)], dim=1)
         _, tokens = model.encode(observations, return_tokens=True)
-        pred_tokens = model.predict(tokens[:, :-1], actions)
+        encoder_latents = tokens[:, -1]
+        generated_latents = model.predict(tokens[:, :-1], actions)[:, -1]
 
-        decoder_tokens = torch.cat([tokens[:, -1:], pred_tokens[:, -1:]], dim=0)
-        decoder_context_tokens = tokens[:, :-1].repeat(2, 1, 1, 1)
-        decoder_actions = actions[:, -1:].repeat(2, 1, 1)
-        recon = model.decoder(
-            decoder_tokens,
-            decoder_actions,
-            context_tokens=decoder_context_tokens,
-        )
-        true_recon, pred_recon = recon.chunk(2, dim=0)
+        generated_ratio = self.curriculum_ratio()
+        use_generated = torch.rand(encoder_latents.size(0), 1, 1, device=encoder_latents.device) < generated_ratio
+        decoder_latents = torch.where(use_generated, generated_latents, encoder_latents)
 
-        target_frame_f = target_frame.float()
-        true_recon_f = true_recon.float()
-        pred_recon_f = pred_recon.float()
-
-        true_recon_l1 = F.l1_loss(true_recon_f, target_frame_f)
-        pred_recon_l1 = F.l1_loss(pred_recon_f, target_frame_f)
-        true_recon_grad_loss = self.grad_loss(true_recon_f, target_frame_f)
-        pred_recon_grad_loss = self.grad_loss(pred_recon_f, target_frame_f)
-        copy_frame_f = frames[:, -1].float()
-        copy_l1 = F.l1_loss(copy_frame_f, target_frame_f)
-        copy_grad_loss = self.grad_loss(copy_frame_f, target_frame_f)
-        true_recon_loss = true_recon_l1 + 0.5 * true_recon_grad_loss
-        pred_recon_loss = pred_recon_l1 + 0.5 * pred_recon_grad_loss
-        loss = true_recon_loss + pred_recon_loss
+        recon = model.decoder(decoder_latents)
+        loss = F.l1_loss(recon.float(), target_frame.float())
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
-            self.log(
-                {
-                    "decoder_loss": self.scalar(loss),
-                    "true_recon_loss": self.scalar(true_recon_loss),
-                    "pred_recon_loss": self.scalar(pred_recon_loss),
-                    "true_recon_l1": self.scalar(true_recon_l1),
-                    "pred_recon_l1": self.scalar(pred_recon_l1),
-                    "copy_l1": self.scalar(copy_l1),
-                    "true_recon_grad_loss": self.scalar(true_recon_grad_loss),
-                    "pred_recon_grad_loss": self.scalar(pred_recon_grad_loss),
-                    "copy_grad_loss": self.scalar(copy_grad_loss),
-                }
-            )
+            self.log({"loss": self.scalar(loss), "generated_latent_ratio": generated_ratio})
 
         if return_outputs:
-            return loss, {"true_recon": true_recon.detach(), "pred_recon": pred_recon.detach()}
+            return loss, {"recon": recon.detach()}
         return loss
 
-class WMTrainer(Trainer):
+class WMTrainer(SectionedWandbTrainer):
+    wandb_section = "wm"
+
     def __init__(self, *args, sigreg_weight: float = 0.1, **kwargs):
         super().__init__(*args, **kwargs)
         self.sigreg_weight = sigreg_weight
@@ -273,7 +244,9 @@ def resolve_checkpoint(resume_from: str | None, output_dir: str) -> str | None:
         raise FileNotFoundError(f"Checkpoint not found: {resume_from}")
     return resume_from
 
-class RewardPolicyTrainer(Trainer):
+class RewardPolicyTrainer(SectionedWandbTrainer):
+    wandb_section = "policy"
+
     def __init__(self, wm_model: WorldModel, *args, reward_temperature: float = 5.0, **kwargs):
         super().__init__(*args, **kwargs)
         self.wm_model = wm_model.eval()
@@ -315,18 +288,18 @@ class RewardPolicyTrainer(Trainer):
             pred_prob = torch.sigmoid(score)
             self.log(
                 {
-                    "policy/ranking_loss": self.scalar(ranking_loss),
-                    "policy/calibration_loss": self.scalar(calibration_loss),
-                    "policy/dist_mean": self.scalar(dist.mean()),
-                    "policy/dist_std": self.scalar(dist.std()),
-                    "policy/y_mean": self.scalar(y.mean()),
-                    "policy/y_std": self.scalar(y.std()),
-                    "policy/y_min": self.scalar(y.min()),
-                    "policy/y_max": self.scalar(y.max()),
-                    "policy/pred_mean": self.scalar(pred_prob.mean()),
-                    "policy/pred_std": self.scalar(pred_prob.std()),
-                    "policy/logit_mean": self.scalar(score.mean()),
-                    "policy/logit_std": self.scalar(score.std()),
+                    "ranking_loss": self.scalar(ranking_loss),
+                    "calibration_loss": self.scalar(calibration_loss),
+                    "dist_mean": self.scalar(dist.mean()),
+                    "dist_std": self.scalar(dist.std()),
+                    "y_mean": self.scalar(y.mean()),
+                    "y_std": self.scalar(y.std()),
+                    "y_min": self.scalar(y.min()),
+                    "y_max": self.scalar(y.max()),
+                    "pred_mean": self.scalar(pred_prob.mean()),
+                    "pred_std": self.scalar(pred_prob.std()),
+                    "logit_mean": self.scalar(score.mean()),
+                    "logit_std": self.scalar(score.std()),
                 }
             )
 
@@ -559,17 +532,11 @@ def train(
 
     for param in model.parameters():
         param.requires_grad = False
-    for module in (
-        model.decoder,
-        model.predictor.projector,
-        model.predictor.blocks.blocks[-1],
-        model.encoder.projector,
-        model.encoder.blocks.blocks[-1],
-    ):
-        for param in module.parameters():
-            param.requires_grad = True
+    for param in model.decoder.parameters():
+        param.requires_grad = True
 
-    model.encoder.train()
+    model.eval()
+    model.decoder.train()
 
     decoder_args = TrainingArguments(
         output_dir=decoder_output_dir,

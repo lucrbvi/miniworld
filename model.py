@@ -73,22 +73,6 @@ class TransformerStack(nn.Module):
             x = block(x)
         return self.norm(x)
 
-class CrossAttentionBlock(nn.Module):
-    def __init__(self, dim: int, n_heads: int, ffn_mult: int = 4, dropout: float = 0.0):
-        super().__init__()
-        self.q_norm = nn.LayerNorm(dim)
-        self.kv_norm = nn.LayerNorm(dim)
-        self.cross_attn = nn.MultiheadAttention(dim, n_heads, dropout=dropout, batch_first=True)
-        self.mlp_norm = nn.LayerNorm(dim)
-        self.mlp = MLP(dim, dim * ffn_mult, dropout=dropout)
-
-    def forward(self, queries: Tensor, memory: Tensor) -> Tensor:
-        q = self.q_norm(queries)
-        kv = self.kv_norm(memory)
-        queries = queries + self.cross_attn(q, kv, kv, need_weights=False)[0]
-        queries = queries + self.mlp(self.mlp_norm(queries))
-        return queries
-
 class Projector(nn.Module):
     def __init__(self, dim: int, hidden_mult: int = 4, dropout: float = 0.0):
         super().__init__()
@@ -154,44 +138,32 @@ class Decoder(nn.Module):
         self.n_patches = self.grid_h * self.grid_w
         patch_dim = config.patch_size * config.patch_size * 3
 
-        self.action_proj = nn.Linear(config.action_dim, config.dim)
-        self.queries = nn.Parameter(torch.randn(1, self.n_patches, config.dim) * 0.02)
-        self.query_pos = nn.Parameter(torch.randn(1, self.n_patches, config.dim) * 0.02)
-        self.memory_pos = nn.Parameter(torch.randn(1, config.max_seq_len * self.n_patches, config.dim) * 0.02)
-        self.blocks = nn.ModuleList(
-            [CrossAttentionBlock(config.dim, config.n_heads, config.ffn_mult, config.dropout_proba) for _ in range(config.decoder_blocks)]
+        self.pos = nn.Parameter(torch.randn(1, self.n_patches, config.dim) * 0.02)
+        self.blocks = TransformerStack(
+            config.dim,
+            config.n_heads,
+            config.decoder_blocks,
+            config.ffn_mult,
+            config.dropout_proba,
+            causal=False,
         )
-        self.norm = nn.LayerNorm(config.dim)
         self.to_patch = nn.Linear(config.dim, patch_dim)
 
-    def forward(self, tokens: Tensor, actions: Tensor | None = None, context_tokens: Tensor | None = None) -> Tensor:
-        if tokens.dim() == 3:
-            tokens = tokens.unsqueeze(1)
-        b, t, n, d = tokens.shape
-        memory = tokens.reshape(b, t * n, d)
-        if context_tokens is not None:
-            if context_tokens.dim() == 3:
-                context_tokens = context_tokens.unsqueeze(1)
-            context_patches = context_tokens[:, :, 1:].reshape(context_tokens.size(0), -1, d)
-            memory = torch.cat([context_patches.to(dtype=tokens.dtype), memory], dim=1)
-        pos = self.memory_pos
-        if memory.size(1) > pos.size(1):
-            repeats = (memory.size(1) + pos.size(1) - 1) // pos.size(1)
-            pos = pos.repeat(1, repeats, 1)
-        memory = memory + pos[:, : memory.size(1)]
-        if actions is not None:
-            if actions.dim() == 2:
-                actions = actions.unsqueeze(1)
-            memory = torch.cat([memory, self.action_proj(actions.to(dtype=tokens.dtype))], dim=1)
+    def forward(self, tokens: Tensor) -> Tensor:
+        if tokens.dim() == 4:
+            b, t, n, d = tokens.shape
+            tokens = tokens.reshape(b * t, n, d)
+        if tokens.size(1) == self.n_patches + 1:
+            tokens = tokens[:, 1:]
+        if tokens.size(1) != self.n_patches:
+            raise ValueError(f"Decoder expected {self.n_patches} patch tokens, got {tokens.size(1)}")
 
-        x = self.queries.expand(b, -1, -1) + self.query_pos
-        for block in self.blocks:
-            x = block(x, memory)
-        patches = self.to_patch(self.norm(x))
+        x = self.blocks(tokens + self.pos.to(dtype=tokens.dtype))
+        patches = self.to_patch(x)
         p = self.patch_size
-        img = patches.view(b, self.grid_h, self.grid_w, 3, p, p)
+        img = patches.view(tokens.size(0), self.grid_h, self.grid_w, 3, p, p)
         img = img.permute(0, 3, 1, 4, 2, 5).contiguous()
-        return torch.sigmoid(img.view(b, 3, self.grid_h * p, self.grid_w * p))
+        return torch.sigmoid(img.view(tokens.size(0), 3, self.grid_h * p, self.grid_w * p))
 
 class WorldModelConfig(PretrainedConfig):
     model_type = "world_model"
@@ -259,4 +231,4 @@ class WorldModel(PreTrainedModel):
             return self.predict(tokens, actions)
         _, tokens = self.encode(frames, return_tokens=True)
         pred_tokens = self.predict(tokens, actions)
-        return pred_tokens[:, :, 0], self.decoder(pred_tokens, actions, context_tokens=tokens[:, :1])
+        return pred_tokens[:, :, 0], self.decoder(pred_tokens)

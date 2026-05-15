@@ -231,11 +231,7 @@ def predict_next_frame(
         action_tensor = actions
     with autocast_context(device, amp, token_history.dtype == torch.float16):
         next_tokens = model.predict(token_history, action_tensor)[:, -1]
-        pixel_pred = model.decoder(
-            next_tokens.unsqueeze(1),
-            action_tensor[:, -1:],
-            context_tokens=token_history,
-        )[0]
+        pixel_pred = model.decoder(next_tokens)[0]
         reward = None
         if policy is not None and target_tokens is not None:
             start = token_history[:, 0, 0].float()

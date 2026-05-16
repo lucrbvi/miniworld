@@ -13,7 +13,7 @@ from PIL import Image
 from safetensors.torch import load_file
 
 from dream import ACTION_NAMES, get_device, load_frame, load_world_model
-from model import Policy, WorldModel
+from model import RewardModel, WorldModel
 
 BUTTONS = [
     vzd.Button.MOVE_FORWARD, vzd.Button.MOVE_BACKWARD, vzd.Button.MOVE_LEFT,
@@ -39,27 +39,24 @@ def discretize_action(values: torch.Tensor, threshold: float) -> list[int]:
     action[6:] = [int(a[i] >= threshold) for i in range(6, 9)]
     return action
 
-def load_policy(path: str, config, device: str) -> Policy:
-    policy = Policy(config)
+def load_reward_model(path: str, config, device: str) -> RewardModel:
+    reward_model = RewardModel(config)
     if os.path.isdir(path):
-        safe = os.path.join(path, "policy.safetensors")
-        pt = os.path.join(path, "policy.pt")
-        if os.path.isfile(safe):
-            policy.load_state_dict(load_file(safe, device="cpu"))
-        elif os.path.isfile(pt):
-            policy.load_state_dict(torch.load(pt, map_location="cpu"))
-        else:
-            raise FileNotFoundError(f"Policy introuvable dans {path!r}")
+        candidates = ["reward_model.safetensors", "model.safetensors"]
+        reward_model_path = next((os.path.join(path, name) for name in candidates if os.path.isfile(os.path.join(path, name))), None)
+        if reward_model_path is None:
+            raise FileNotFoundError(f"Reward model not found in {path!r}")
     elif os.path.isfile(path):
-        policy.load_state_dict(load_file(path, device="cpu") if path.endswith(".safetensors") else torch.load(path, map_location="cpu"))
+        reward_model_path = path
     else:
-        raise FileNotFoundError(f"Policy introuvable: {path!r}")
-    policy.to(device=device).eval()
-    for p in policy.parameters():
+        raise FileNotFoundError(f"Reward model not found: {path!r}")
+    reward_model.load_state_dict(load_file(reward_model_path, device="cpu") if reward_model_path.endswith(".safetensors") else torch.load(reward_model_path, map_location="cpu"))
+    reward_model.to(device=device).eval()
+    for p in reward_model.parameters():
         p.requires_grad_(False)
-    return policy
+    return reward_model
 
-def plan(model: WorldModel, policy: Policy | None, token_history: torch.Tensor, action_history: torch.Tensor, target: torch.Tensor, previous_logits: torch.Tensor | None, args: argparse.Namespace, device: str) -> tuple[list[int], torch.Tensor, float]:
+def plan(model: WorldModel, reward_model: RewardModel | None, token_history: torch.Tensor, action_history: torch.Tensor, target: torch.Tensor, previous_logits: torch.Tensor | None, args: argparse.Namespace, device: str) -> tuple[list[int], torch.Tensor, float]:
     n_actions = len(ACTION_NAMES)
     if previous_logits is not None and previous_logits.shape == (args.candidates, args.horizon, n_actions):
         shifted = torch.cat([previous_logits[:, 1:].detach(), torch.randn(args.candidates, 1, n_actions, device=device)], dim=1)
@@ -84,11 +81,11 @@ def plan(model: WorldModel, policy: Policy | None, token_history: torch.Tensor, 
                 pred = model.predict(tokens, act.to(tokens.dtype))[:, -1]
                 current = pred[:, 0].float()
                 goal = target[:, 0].expand_as(current).float()
-                if policy is None:
-                    reward = -F.mse_loss(current, goal, reduction="none").mean(dim=-1)
+                if reward_model is None:
+                    reward = -F.mse_loss(current[:, 0], goal[:, 0], reduction="none").mean(dim=-1)
                 else:
-                    start = token_history[:, 0, 0].expand_as(current).float()
-                    reward = torch.sigmoid(policy(start, current, goal))
+                    start = token_history[:, 0].expand_as(current).float()
+                    reward = torch.sigmoid(reward_model(start, current.float(), goal.float()))
                 rewards.append(reward * (args.gamma ** t))
                 tokens = torch.cat([tokens, pred.unsqueeze(1)], dim=1)
             returns = torch.stack(rewards, dim=1).sum(dim=1)
@@ -110,7 +107,7 @@ def run(args: argparse.Namespace) -> None:
         p.requires_grad_(False)
     cfg = model.config
     target = encode(model, load_frame(args.target_frame, cfg.height, cfg.width), device, args.amp)
-    policy = load_policy(args.policy, model.config, device) if args.policy else None
+    reward_model = load_reward_model(args.reward_model, model.config, device) if args.reward_model else None
     game = vzd.DoomGame()
     if args.wad:
         game.set_doom_game_path(args.wad)
@@ -151,7 +148,7 @@ def run(args: argparse.Namespace) -> None:
             token_history = token_history[:, -args.context_len:]
             action_history = action_history[-token_history.size(1):]
             action_tensor = torch.tensor(action_history, device=device, dtype=torch.float32).unsqueeze(0)
-            action, last_plan, reward = plan(model, policy, token_history, action_tensor, target, last_plan, args, device)
+            action, last_plan, reward = plan(model, reward_model, token_history, action_tensor, target, last_plan, args, device)
             action_history[-1] = action
             game.make_action(action, args.frame_skip)
             if args.log_every and step % args.log_every == 0:
@@ -184,7 +181,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=0.25)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--gamma", type=float, default=0.99, help="Reward discount inside Grad-MPC")
-    parser.add_argument("--policy", default=None, help="Optional external reward policy dir/.safetensors/.pt")
+    parser.add_argument("--reward-model", default=None, help="Optional reward model dir/.safetensors")
     parser.add_argument("--frame-skip", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--log-every", type=int, default=1)

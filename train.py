@@ -4,6 +4,7 @@ import math
 import os
 
 import lejepa
+import lpips
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -13,7 +14,7 @@ from safetensors.torch import save_file
 from transformers import Trainer, TrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
 
-from model import Policy, WorldModel, WorldModelConfig
+from model import RewardModel, WorldModel, WorldModelConfig
 
 WANDB_PROJECT = "miniworld-wm"
 
@@ -127,6 +128,14 @@ def scalar(value: torch.Tensor) -> float:
 class DecoderTrainer(SectionedWandbTrainer):
     wandb_section = "decoder"
 
+    def __init__(self, *args, lpips_weight: float = 0.1, rollout_weight: float = 1.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.lpips_weight = lpips_weight
+        self.rollout_weight = rollout_weight
+        self.lpips_loss = lpips.LPIPS(net="alex").eval()
+        for param in self.lpips_loss.parameters():
+            param.requires_grad = False
+
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad(), self.compute_loss_context_manager():
@@ -141,12 +150,21 @@ class DecoderTrainer(SectionedWandbTrainer):
 
         model.encoder.eval()
         model.predictor.eval()
+        self.lpips_loss = self.lpips_loss.to(frames.device)
 
         with torch.no_grad():
             observations = torch.cat([frames, target_frame.unsqueeze(1)], dim=1)
             _, tokens = model.encode(observations, return_tokens=True)
             encoder_latents = tokens[:, -1]
             predicted_latents = model.predict(tokens[:, :-1], actions)[:, -1]
+            rollout_latents = []
+            rollout_tokens = tokens[:, :1]
+            for t in range(actions.size(1)):
+                pred_tokens = model.predict(rollout_tokens, actions[:, : t + 1])
+                next_tokens = pred_tokens[:, -1]
+                rollout_latents.append(next_tokens)
+                rollout_tokens = torch.cat([rollout_tokens, next_tokens.unsqueeze(1)], dim=1)
+            rollout_latents = torch.stack(rollout_latents, dim=1)
             if self.state.max_steps <= 0:
                 progress = 0.0
             else:
@@ -156,18 +174,26 @@ class DecoderTrainer(SectionedWandbTrainer):
             use_pred = torch.rand(encoder_latents.size(0), 1, 1, device=encoder_latents.device) < pred_ratio
             decoder_latents = torch.where(use_pred, predicted_latents, encoder_latents)
             if model.config.decoder_noise_std > 0:
-                noise = torch.randn_like(decoder_latents) * model.config.decoder_noise_std
-                decoder_latents = decoder_latents + noise
+                decoder_latents = decoder_latents + torch.randn_like(decoder_latents) * model.config.decoder_noise_std
+                rollout_latents = rollout_latents + torch.randn_like(rollout_latents) * model.config.decoder_noise_std
 
         recon = model.decoder(decoder_latents)
+        rollout_recon = model.decoder(rollout_latents)
+        rollout_target = observations[:, 1:].reshape(-1, *observations.shape[2:])
         l1_loss = F.l1_loss(recon.float(), target_frame.float())
-        loss = l1_loss
+        rollout_l1_loss = F.l1_loss(rollout_recon.float(), rollout_target.float())
+        lpips_loss = self.lpips_loss(recon.float() * 2 - 1, target_frame.float() * 2 - 1).mean()
+        rollout_lpips_loss = self.lpips_loss(rollout_recon.float() * 2 - 1, rollout_target.float() * 2 - 1).mean()
+        loss = l1_loss + self.rollout_weight * rollout_l1_loss + self.lpips_weight * (lpips_loss + self.rollout_weight * rollout_lpips_loss)
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
             self.log(
                 {
                     "loss": scalar(loss),
                     "l1": scalar(l1_loss),
+                    "rollout_l1": scalar(rollout_l1_loss),
+                    "lpips": scalar(lpips_loss),
+                    "rollout_lpips": scalar(rollout_lpips_loss),
                     "pred_token_ratio": pred_ratio,
                     "used_pred_token_ratio": scalar(use_pred.float().mean()),
                     "latent_noise_std": model.config.decoder_noise_std,
@@ -209,12 +235,21 @@ class WMTrainer(SectionedWandbTrainer):
         observations = torch.cat([frames, target_frame], dim=1)
         embeddings, tokens = model.encode(observations, return_tokens=True)
         pred_tokens = model.predict(tokens[:, :-1], actions)
+        rollout_preds = []
+        rollout_tokens = tokens[:, :1]
+        for t in range(actions.size(1)):
+            next_preds = model.predict(rollout_tokens, actions[:, : t + 1])[:, -1]
+            rollout_preds.append(next_preds)
+            rollout_tokens = torch.cat([rollout_tokens, next_preds.unsqueeze(1)], dim=1)
+        rollout_preds = torch.stack(rollout_preds, dim=1)
 
         sigreg_loss = torch.stack(
             [self.sigreg(embeddings[:, t].float()) for t in range(embeddings.size(1))]
         ).mean()
         pred_loss = F.mse_loss(pred_tokens[:, :, 0].float(), embeddings[:, 1:].float())
-        loss = pred_loss + self.sigreg_weight * sigreg_loss
+        token_pred_loss = F.mse_loss(pred_tokens.float(), tokens[:, 1:].float())
+        rollout_loss = F.mse_loss(rollout_preds.float(), tokens[:, 1:].float())
+        loss = pred_loss + token_pred_loss + rollout_loss + self.sigreg_weight * sigreg_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
             flat_z = embeddings.flatten(0, 1)
@@ -225,6 +260,8 @@ class WMTrainer(SectionedWandbTrainer):
                 {
                     "loss_total": scalar(loss),
                     "pred_loss": scalar(pred_loss),
+                    "token_pred_loss": scalar(token_pred_loss),
+                    "rollout_loss": scalar(rollout_loss),
                     "sigreg": scalar(sigreg_loss),
                     "z_std_mean": scalar(z_std.mean()),
                     "z_std_min": scalar(z_std.min()),
@@ -258,13 +295,15 @@ def resolve_checkpoint(resume_from: str | None, output_dir: str) -> str | None:
         raise FileNotFoundError(f"Checkpoint not found: {resume_from}")
     return resume_from
 
-class RewardPolicyTrainer(SectionedWandbTrainer):
-    wandb_section = "policy"
+class RewardModelTrainer(SectionedWandbTrainer):
+    wandb_section = "reward_model"
 
-    def __init__(self, wm_model: WorldModel, *args, reward_temperature: float = 5.0, **kwargs):
+    def __init__(self, wm_model: WorldModel, *args, rank_temperature: float = 0.25, reward_tau: float = 8.0, predicted_ratio: float = 0.5, **kwargs):
         super().__init__(*args, **kwargs)
         self.wm_model = wm_model.eval()
-        self.reward_temperature = reward_temperature
+        self.rank_temperature = rank_temperature
+        self.reward_tau = reward_tau
+        self.predicted_ratio = predicted_ratio
         for p in self.wm_model.parameters():
             p.requires_grad = False
 
@@ -281,55 +320,66 @@ class RewardPolicyTrainer(SectionedWandbTrainer):
         actions = inputs["actions"].to(device=self.args.device, dtype=dtype)
 
         with torch.no_grad():
-            _, tokens = self.wm_model.encode(torch.cat([frames, target_frame], dim=1), return_tokens=True)
-            predicted = self.wm_model.predict(tokens[:, :-1], actions)[:, :, 0].float()
-            start = tokens[:, :1, 0].float().expand_as(predicted)
-            target = tokens[:, -1:, 0].float().expand_as(predicted)
+            observations = torch.cat([frames, target_frame], dim=1)
+            _, real_tokens = self.wm_model.encode(observations, return_tokens=True)
+            pred_tokens = self.wm_model.predict(real_tokens[:, :-1], actions)
+            use_pred = torch.rand(real_tokens.size(0), 1, 1, 1, device=real_tokens.device) < self.predicted_ratio
+            candidate_tokens = torch.where(use_pred, pred_tokens, real_tokens[:, 1:])
 
-        score = model(start, predicted, target).float()
-        dist = torch.linalg.vector_norm(predicted - target, dim=-1)
-        batch_idx = torch.arange(score.size(0), device=score.device)
-        i = torch.randint(0, score.size(1), (score.size(0),), device=score.device)
-        j = torch.randint(0, score.size(1), (score.size(0),), device=score.device)
-        logits = score[batch_idx, i] - score[batch_idx, j]
-        better_i = (dist[batch_idx, i] < dist[batch_idx, j]).float()
-        ranking_loss = F.binary_cross_entropy_with_logits(logits, better_i)
+        batch_size = real_tokens.size(0)
+        steps = candidate_tokens.size(1)
+        batch_idx = torch.arange(batch_size, device=real_tokens.device)
+        i = torch.randint(0, steps, (batch_size,), device=real_tokens.device)
+        j = torch.randint(0, steps, (batch_size,), device=real_tokens.device)
+        current_i = candidate_tokens[batch_idx, i]
+        current_j = candidate_tokens[batch_idx, j]
+        start = real_tokens[:, 0]
+        goal = real_tokens[:, -1]
+        score_i = model(start.float(), current_i.float(), goal.float())
+        score_j = model(start.float(), current_j.float(), goal.float())
+        rank_logit = (score_i - score_j) / self.rank_temperature
+        rank_label = (i > j).float()
+        ranking_loss = F.binary_cross_entropy_with_logits(rank_logit, rank_label)
 
-        # Auxiliary absolute reward keeps score calibration sane without per-sequence max normalization.
-        y = torch.exp(-dist / self.reward_temperature)
-        calibration_loss = F.binary_cross_entropy_with_logits(score, y)
-        loss = ranking_loss + 0.1 * calibration_loss
+        flat_current = candidate_tokens.reshape(batch_size * steps, *candidate_tokens.shape[2:])
+        flat_start = start[:, None].expand(-1, steps, -1, -1).reshape_as(flat_current)
+        flat_goal = goal[:, None].expand(-1, steps, -1, -1).reshape_as(flat_current)
+        flat_score = model(flat_start.float(), flat_current.float(), flat_goal.float())
+        steps_to_goal = torch.arange(steps - 1, -1, -1, device=real_tokens.device, dtype=torch.float32)
+        y = torch.exp(-steps_to_goal / self.reward_tau).repeat(batch_size)
+        calibration_loss = F.binary_cross_entropy_with_logits(flat_score, y)
+
+        wrong_goal = goal.roll(1, dims=0)
+        wrong_score = model(start.float(), candidate_tokens[:, -1].float(), wrong_goal.float())
+        negative_goal_loss = F.binary_cross_entropy_with_logits(wrong_score, torch.zeros_like(wrong_score))
+        loss = ranking_loss + 0.05 * calibration_loss + 0.01 * negative_goal_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
-            pred_prob = torch.sigmoid(score)
+            score = torch.cat([score_i, score_j, flat_score, wrong_score])
             self.log(
                 {
                     "ranking_loss": scalar(ranking_loss),
                     "calibration_loss": scalar(calibration_loss),
-                    "dist_mean": scalar(dist.mean()),
-                    "dist_std": scalar(dist.std()),
-                    "y_mean": scalar(y.mean()),
-                    "y_std": scalar(y.std()),
-                    "y_min": scalar(y.min()),
-                    "y_max": scalar(y.max()),
-                    "pred_mean": scalar(pred_prob.mean()),
-                    "pred_std": scalar(pred_prob.std()),
-                    "logit_mean": scalar(score.mean()),
-                    "logit_std": scalar(score.std()),
+                    "negative_goal_loss": scalar(negative_goal_loss),
+                    "used_predicted_ratio": scalar(use_pred.float().mean()),
+                    "score_mean": scalar(score.mean()),
+                    "score_std": scalar(score.std()),
+                    "prob_mean": scalar(torch.sigmoid(score).mean()),
+                    "prob_std": scalar(torch.sigmoid(score).std()),
                 }
             )
 
         if return_outputs:
-            return loss, {"scores": score.detach(), "dist": dist.detach(), "y": y.detach()}
+            return loss, {"score_i": score_i.detach(), "score_j": score_j.detach(), "y": y.detach()}
         return loss
 
-    def save_policy(self, output_dir: str | None = None) -> None:
+    def save_reward_model(self, output_dir: str | None = None) -> None:
         output_dir = output_dir or self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
-        save_file(self.model.state_dict(), os.path.join(output_dir, "policy.safetensors"))
-        with open(os.path.join(output_dir, "policy_config.json"), "w") as f:
+        save_file(self.model.state_dict(), os.path.join(output_dir, "reward_model.safetensors"))
+        with open(os.path.join(output_dir, "reward_model_config.json"), "w") as f:
             json.dump(self.wm_model.config.to_dict(), f, indent=2)
-        print(f"Saved external policy to {output_dir} (policy.safetensors and policy_config.json)", flush=True)
+        print(f"Saved reward model to {output_dir} (reward_model.safetensors and reward_model_config.json)", flush=True)
 
 def train(
     config: WorldModelConfig,
@@ -341,8 +391,8 @@ def train(
     sequence_stride: int = 1,
     max_eval_sequences: int = 2048,
 ):
-    if mode not in {"wm", "decoder", "policy"}:
-        raise ValueError("mode must be 'wm', 'decoder' or 'policy'")
+    if mode not in {"wm", "decoder", "reward_model"}:
+        raise ValueError("mode must be 'wm', 'decoder' or 'reward_model'")
     device = device_name()
     if device == "cuda":
         torch.set_float32_matmul_precision("high")
@@ -392,7 +442,7 @@ def train(
 
     wm_output_dir = os.path.join(output_root, "world-model")
     decoder_output_dir = os.path.join(output_root, "decoder")
-    policy_output_dir = os.path.join(output_root, "policy")
+    reward_model_output_dir = os.path.join(output_root, "reward-model")
 
     args = TrainingArguments(
         output_dir=wm_output_dir,
@@ -467,8 +517,8 @@ def train(
         trainer.model.to(torch.bfloat16)
         trainer.save_model(args.output_dir)
         finish_wandb()
-        policy_args = TrainingArguments(
-            output_dir=policy_output_dir,
+        reward_model_args = TrainingArguments(
+            output_dir=reward_model_output_dir,
             num_train_epochs=1,
             per_device_train_batch_size=args.per_device_train_batch_size * 4,
             per_device_eval_batch_size=args.per_device_eval_batch_size * 4,
@@ -487,20 +537,20 @@ def train(
             dataloader_persistent_workers=True,
             remove_unused_columns=False,
             report_to=[],
-            run_name="reward-policy",
+            run_name="reward-model",
             optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
             torch_compile=True,
         )
-        policy_trainer = RewardPolicyTrainer(
+        reward_model_trainer = RewardModelTrainer(
             wm_model=trainer.model,
-            model=Policy(trainer.model.config),
-            args=policy_args,
+            model=RewardModel(trainer.model.config),
+            args=reward_model_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
         )
-        start_wandb_run("reward-policy", config=config.to_dict())
-        policy_trainer.train()
-        policy_trainer.save_policy(policy_args.output_dir)
+        start_wandb_run("reward-model", config=config.to_dict())
+        reward_model_trainer.train()
+        reward_model_trainer.save_reward_model(reward_model_args.output_dir)
         finish_wandb()
         return
 
@@ -513,9 +563,9 @@ def train(
     print(f"Loading pretrained world model from: {pretrained_checkpoint}", flush=True)
     model = WorldModel.from_pretrained(pretrained_checkpoint, ignore_mismatched_sizes=True).to(device=device, dtype=torch.bfloat16)
 
-    if mode == "policy":
-        policy_args = TrainingArguments(
-            output_dir=policy_output_dir,
+    if mode == "reward_model":
+        reward_model_args = TrainingArguments(
+            output_dir=reward_model_output_dir,
             num_train_epochs=1,
             per_device_train_batch_size=args.per_device_train_batch_size * 5,
             per_device_eval_batch_size=args.per_device_eval_batch_size * 5,
@@ -534,20 +584,20 @@ def train(
             dataloader_persistent_workers=True,
             remove_unused_columns=False,
             report_to=[],
-            run_name="reward-policy",
+            run_name="reward-model",
             optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
             torch_compile=True,
         )
-        policy_trainer = RewardPolicyTrainer(
+        reward_model_trainer = RewardModelTrainer(
             wm_model=model,
-            model=Policy(model.config),
-            args=policy_args,
+            model=RewardModel(model.config),
+            args=reward_model_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
         )
-        start_wandb_run("reward-policy", config=config.to_dict())
-        policy_trainer.train()
-        policy_trainer.save_policy(policy_args.output_dir)
+        start_wandb_run("reward-model", config=config.to_dict())
+        reward_model_trainer.train()
+        reward_model_trainer.save_reward_model(reward_model_args.output_dir)
         finish_wandb()
         return
 
@@ -599,11 +649,11 @@ def train(
     finish_wandb()
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train miniworld world model, decoder probe, or reward policy.")
-    parser.add_argument("--mode", choices=["wm", "decoder", "policy"], default="wm")
+    parser = argparse.ArgumentParser(description="Train miniworld world model, decoder probe, or reward model.")
+    parser.add_argument("--mode", choices=["wm", "decoder", "reward_model"], default="wm")
     parser.add_argument("--output-root", default=os.environ.get("MINIWORLD_CHECKPOINT_DIR", "./checkpoints"))
     parser.add_argument("--resume-from", default="auto", help="auto, none, or a checkpoint directory")
-    parser.add_argument("--wm-checkpoint", default=None, help="Pretrained WM checkpoint for --mode decoder")
+    parser.add_argument("--wm-checkpoint", default=None, help="Pretrained WM checkpoint for --mode decoder or reward_model")
     parser.add_argument("--context-len", type=int, default=10)
     parser.add_argument("--sequence-stride", type=int, default=1)
     parser.add_argument("--max-eval-sequences", type=int, default=512)

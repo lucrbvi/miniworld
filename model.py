@@ -19,24 +19,34 @@ class MLP(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return self.net(x)
 
-class Policy(nn.Module):
+class RewardModel(nn.Module):
     def __init__(self, config: "WorldModelConfig"):
         super().__init__()
         dim = config.dim
-        hidden = dim * 2
-        self.in_proj = nn.Linear(dim * 6, dim)
-        self.norm1 = nn.LayerNorm(dim)
-        self.mlp1 = MLP(dim, hidden_dim=hidden, dropout=config.dropout_proba)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp2 = MLP(dim, hidden_dim=hidden, dropout=config.dropout_proba)
-        self.out_proj = nn.Linear(dim, 1)
+        self.value_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.type_pos = nn.Parameter(torch.randn(1, 3, 1, dim) * 0.02)
+        self.blocks = TransformerStack(dim, config.n_heads, 2, config.ffn_mult, config.dropout_proba, causal=False)
+        self.head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, 1),
+        )
 
-    def forward(self, start: Tensor, current: Tensor, target: Tensor) -> Tensor:
-        x = torch.cat([start, current, target, current - start, target - current, current * target], dim=-1)
-        x = self.in_proj(x)
-        x = x + self.mlp1(self.norm1(x))
-        x = x + self.mlp2(self.norm2(x))
-        return self.out_proj(x).squeeze(-1)
+    def forward(self, start: Tensor, current: Tensor, goal: Tensor) -> Tensor:
+        if start.dim() == 2:
+            start = start.unsqueeze(1)
+        if current.dim() == 2:
+            current = current.unsqueeze(1)
+        if goal.dim() == 2:
+            goal = goal.unsqueeze(1)
+        start = start + self.type_pos[:, 0]
+        current = current + self.type_pos[:, 1]
+        goal = goal + self.type_pos[:, 2]
+        value = self.value_token.expand(start.size(0), -1, -1)
+        x = torch.cat([value, start, current, goal], dim=1)
+        x = self.blocks(x)
+        return self.head(x[:, 0]).squeeze(-1)
 
 class TransformerBlock(nn.Module):
     def __init__(self, dim: int, n_heads: int, ffn_mult: int = 4, dropout: float = 0.0, causal: bool = False):
@@ -145,6 +155,14 @@ class Decoder(nn.Module):
             nn.Linear(config.dim, config.dim),
             nn.SiLU(),
         )
+        self.spatial_blocks = TransformerStack(
+            config.dim,
+            config.n_heads,
+            max(1, config.decoder_n_blocks),
+            config.ffn_mult,
+            config.dropout_proba,
+            causal=False,
+        )
         self.to_patch = nn.Sequential(
             nn.LayerNorm(config.dim),
             nn.Linear(config.dim, hidden),
@@ -163,7 +181,8 @@ class Decoder(nn.Module):
         if tokens.size(1) != self.n_patches:
             raise ValueError(f"Decoder expected {self.n_patches} patch tokens, got {tokens.size(1)}")
 
-        patches = self.to_patch(tokens + self.pos.to(dtype=tokens.dtype))
+        tokens = self.spatial_blocks(tokens + self.pos.to(dtype=tokens.dtype))
+        patches = self.to_patch(tokens)
         p = self.patch_size
         img = patches.view(tokens.size(0), self.grid_h, self.grid_w, 3, p, p)
         img = img.permute(0, 3, 1, 4, 2, 5).contiguous()
@@ -181,6 +200,7 @@ class WorldModelConfig(PretrainedConfig):
         n_heads: int = 4,
         n_blocks: int = 3,
         decoder_hidden_mult: int = 4,
+        decoder_n_blocks: int = 2,
         decoder_noise_std: float = 0.05,
         decoder_pred_token_ratio: float = 0.5,
         decoder_curriculum_end: float = 0.8,
@@ -199,6 +219,7 @@ class WorldModelConfig(PretrainedConfig):
         self.n_heads = n_heads
         self.n_blocks = n_blocks
         self.decoder_hidden_mult = decoder_hidden_mult
+        self.decoder_n_blocks = decoder_n_blocks
         self.decoder_noise_std = decoder_noise_std
         self.decoder_pred_token_ratio = decoder_pred_token_ratio
         self.decoder_curriculum_end = decoder_curriculum_end

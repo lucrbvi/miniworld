@@ -207,9 +207,10 @@ class DecoderTrainer(SectionedWandbTrainer):
 class WMTrainer(SectionedWandbTrainer):
     wandb_section = "wm"
 
-    def __init__(self, *args, sigreg_weight: float = 0.1, **kwargs):
+    def __init__(self, *args, sigreg_weight: float = 0.1, rollout_steps: int = 2, **kwargs):
         super().__init__(*args, **kwargs)
         self.sigreg_weight = sigreg_weight
+        self.rollout_steps = rollout_steps
         self.sigreg = lejepa.multivariate.SlicingUnivariateTest(
             univariate_test=lejepa.univariate.EppsPulley(n_points=17),
             num_slices=1024,
@@ -235,9 +236,10 @@ class WMTrainer(SectionedWandbTrainer):
         observations = torch.cat([frames, target_frame], dim=1)
         embeddings, tokens = model.encode(observations, return_tokens=True)
         pred_tokens = model.predict(tokens[:, :-1], actions)
+        rollout_len = min(self.rollout_steps, actions.size(1))
         rollout_preds = []
         rollout_tokens = tokens[:, :1]
-        for t in range(actions.size(1)):
+        for t in range(rollout_len):
             next_preds = model.predict(rollout_tokens, actions[:, : t + 1])[:, -1]
             rollout_preds.append(next_preds)
             rollout_tokens = torch.cat([rollout_tokens, next_preds.unsqueeze(1)], dim=1)
@@ -248,7 +250,7 @@ class WMTrainer(SectionedWandbTrainer):
         ).mean()
         pred_loss = F.mse_loss(pred_tokens[:, :, 0].float(), embeddings[:, 1:].float())
         token_pred_loss = F.mse_loss(pred_tokens.float(), tokens[:, 1:].float())
-        rollout_loss = F.mse_loss(rollout_preds.float(), tokens[:, 1:].float())
+        rollout_loss = F.mse_loss(rollout_preds.float(), tokens[:, 1 : 1 + rollout_len].float())
         loss = pred_loss + token_pred_loss + rollout_loss + self.sigreg_weight * sigreg_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:

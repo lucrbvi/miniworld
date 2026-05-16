@@ -383,7 +383,7 @@ class RewardModelTrainer(SectionedWandbTrainer):
 
 def train(
     config: WorldModelConfig,
-    mode: str = "wm",
+    mode: str = "all",
     output_root: str = "./checkpoints",
     resume_from: str | None = "auto",
     wm_checkpoint: str | None = None,
@@ -391,8 +391,8 @@ def train(
     sequence_stride: int = 1,
     max_eval_sequences: int = 2048,
 ):
-    if mode not in {"wm", "decoder", "reward_model"}:
-        raise ValueError("mode must be 'wm', 'decoder' or 'reward_model'")
+    if mode not in {"all", "wm", "decoder", "reward_model"}:
+        raise ValueError("mode must be 'all', 'wm', 'decoder' or 'reward_model'")
     device = device_name()
     if device == "cuda":
         torch.set_float32_matmul_precision("high")
@@ -502,7 +502,7 @@ def train(
                     last_checkpoint = None
                     break
 
-    if mode == "wm":
+    if mode in {"all", "wm"}:
         trainer = WMTrainer(
             model=model,
             args=args,
@@ -517,51 +517,18 @@ def train(
         trainer.model.to(torch.bfloat16)
         trainer.save_model(args.output_dir)
         finish_wandb()
-        reward_model_args = TrainingArguments(
-            output_dir=reward_model_output_dir,
-            num_train_epochs=1,
-            per_device_train_batch_size=args.per_device_train_batch_size * 4,
-            per_device_eval_batch_size=args.per_device_eval_batch_size * 4,
-            learning_rate=1e-4,
-            weight_decay=1e-4,
-            max_grad_norm=1.0,
-            bf16=device == "cuda",
-            logging_steps=20,
-            eval_strategy="steps",
-            eval_steps=500,
-            save_strategy="steps",
-            save_steps=1000,
-            dataloader_num_workers=16,
-            dataloader_prefetch_factor=4,
-            dataloader_pin_memory=True,
-            dataloader_persistent_workers=True,
-            remove_unused_columns=False,
-            report_to=[],
-            run_name="reward-model",
-            optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
-            torch_compile=True,
-        )
-        reward_model_trainer = RewardModelTrainer(
-            wm_model=trainer.model,
-            model=RewardModel(trainer.model.config),
-            args=reward_model_args,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-        )
-        start_wandb_run("reward-model", config=config.to_dict())
-        reward_model_trainer.train()
-        reward_model_trainer.save_reward_model(reward_model_args.output_dir)
-        finish_wandb()
-        return
-
-    pretrained_checkpoint = wm_checkpoint or find_last_checkpoint(wm_output_dir)
-    if pretrained_checkpoint is None:
-        raise RuntimeError(
-            f"{mode.capitalize()} mode needs a pretrained world model. "
-            "Pass --wm-checkpoint or train with --mode wm first."
-        )
-    print(f"Loading pretrained world model from: {pretrained_checkpoint}", flush=True)
-    model = WorldModel.from_pretrained(pretrained_checkpoint, ignore_mismatched_sizes=True).to(device=device, dtype=torch.bfloat16)
+        if mode == "wm":
+            return
+        model = trainer.model
+    else:
+        pretrained_checkpoint = wm_checkpoint or find_last_checkpoint(wm_output_dir)
+        if pretrained_checkpoint is None:
+            raise RuntimeError(
+                f"{mode.capitalize()} mode needs a pretrained world model. "
+                "Pass --wm-checkpoint or train with --mode wm first."
+            )
+        print(f"Loading pretrained world model from: {pretrained_checkpoint}", flush=True)
+        model = WorldModel.from_pretrained(pretrained_checkpoint, ignore_mismatched_sizes=True).to(device=device, dtype=torch.bfloat16)
 
     if mode == "reward_model":
         reward_model_args = TrainingArguments(
@@ -647,10 +614,48 @@ def train(
     trainer.model.to(torch.bfloat16)
     trainer.save_model(decoder_args.output_dir)
     finish_wandb()
+    if mode == "decoder":
+        return
+
+    reward_model_args = TrainingArguments(
+        output_dir=reward_model_output_dir,
+        num_train_epochs=1,
+        per_device_train_batch_size=args.per_device_train_batch_size * 5,
+        per_device_eval_batch_size=args.per_device_eval_batch_size * 5,
+        learning_rate=1e-4,
+        weight_decay=1e-4,
+        max_grad_norm=1.0,
+        bf16=device == "cuda",
+        logging_steps=20,
+        eval_strategy="steps",
+        eval_steps=500,
+        save_strategy="steps",
+        save_steps=1000,
+        dataloader_num_workers=16,
+        dataloader_prefetch_factor=4,
+        dataloader_pin_memory=True,
+        dataloader_persistent_workers=True,
+        remove_unused_columns=False,
+        report_to=[],
+        run_name="reward-model",
+        optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
+        torch_compile=True,
+    )
+    reward_model_trainer = RewardModelTrainer(
+        wm_model=model,
+        model=RewardModel(model.config),
+        args=reward_model_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+    )
+    start_wandb_run("reward-model", config=config.to_dict())
+    reward_model_trainer.train()
+    reward_model_trainer.save_reward_model(reward_model_args.output_dir)
+    finish_wandb()
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train miniworld world model, decoder probe, or reward model.")
-    parser.add_argument("--mode", choices=["wm", "decoder", "reward_model"], default="wm")
+    parser.add_argument("--mode", choices=["all", "wm", "decoder", "reward_model"], default="all")
     parser.add_argument("--output-root", default=os.environ.get("MINIWORLD_CHECKPOINT_DIR", "./checkpoints"))
     parser.add_argument("--resume-from", default="auto", help="auto, none, or a checkpoint directory")
     parser.add_argument("--wm-checkpoint", default=None, help="Pretrained WM checkpoint for --mode decoder or reward_model")

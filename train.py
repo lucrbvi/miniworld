@@ -28,10 +28,6 @@ def start_wandb_run(name: str, config: dict | None = None) -> None:
     finish_wandb()
     wandb.init(project=os.environ.get("WANDB_PROJECT", WANDB_PROJECT), name=name, config=config)
 
-def log_metrics(metrics: dict, step: int | None = None) -> None:
-    if wandb.run is not None:
-        wandb.log(metrics, step=step)
-
 def find_last_checkpoint(path: str) -> str | None:
     return get_last_checkpoint(path) if os.path.isdir(path) else None
 
@@ -125,18 +121,11 @@ class SectionedWandbTrainer(Trainer):
         self.state.log_history.append(output)
         self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
 
+def scalar(value: torch.Tensor) -> float:
+    return value.detach().float().cpu().item()
+
 class DecoderTrainer(SectionedWandbTrainer):
     wandb_section = "decoder"
-
-    @staticmethod
-    def scalar(value: torch.Tensor) -> float:
-        return value.detach().float().cpu().item()
-
-    def curriculum_ratio(self) -> float:
-        max_steps = self.args.max_steps if self.args.max_steps and self.args.max_steps > 0 else self.state.max_steps
-        if not max_steps:
-            return 0.0
-        return min(1.0, self.state.global_step / max_steps)
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
@@ -153,20 +142,37 @@ class DecoderTrainer(SectionedWandbTrainer):
         model.encoder.eval()
         model.predictor.eval()
 
-        observations = torch.cat([frames, target_frame.unsqueeze(1)], dim=1)
-        _, tokens = model.encode(observations, return_tokens=True)
-        encoder_latents = tokens[:, -1]
-        generated_latents = model.predict(tokens[:, :-1], actions)[:, -1]
-
-        generated_ratio = self.curriculum_ratio()
-        use_generated = torch.rand(encoder_latents.size(0), 1, 1, device=encoder_latents.device) < generated_ratio
-        decoder_latents = torch.where(use_generated, generated_latents, encoder_latents)
+        with torch.no_grad():
+            observations = torch.cat([frames, target_frame.unsqueeze(1)], dim=1)
+            _, tokens = model.encode(observations, return_tokens=True)
+            encoder_latents = tokens[:, -1]
+            predicted_latents = model.predict(tokens[:, :-1], actions)[:, -1]
+            if self.state.max_steps <= 0:
+                progress = 0.0
+            else:
+                end_step = max(1.0, self.state.max_steps * model.config.decoder_curriculum_end)
+                progress = min(1.0, self.state.global_step / end_step)
+            pred_ratio = model.config.decoder_pred_token_ratio * progress
+            use_pred = torch.rand(encoder_latents.size(0), 1, 1, device=encoder_latents.device) < pred_ratio
+            decoder_latents = torch.where(use_pred, predicted_latents, encoder_latents)
+            if model.config.decoder_noise_std > 0:
+                noise = torch.randn_like(decoder_latents) * model.config.decoder_noise_std
+                decoder_latents = decoder_latents + noise
 
         recon = model.decoder(decoder_latents)
-        loss = F.l1_loss(recon.float(), target_frame.float())
+        l1_loss = F.l1_loss(recon.float(), target_frame.float())
+        loss = l1_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
-            self.log({"loss": self.scalar(loss), "generated_latent_ratio": generated_ratio})
+            self.log(
+                {
+                    "loss": scalar(loss),
+                    "l1": scalar(l1_loss),
+                    "pred_token_ratio": pred_ratio,
+                    "used_pred_token_ratio": scalar(use_pred.float().mean()),
+                    "latent_noise_std": model.config.decoder_noise_std,
+                }
+            )
 
         if return_outputs:
             return loss, {"recon": recon.detach()}
@@ -183,10 +189,6 @@ class WMTrainer(SectionedWandbTrainer):
             num_slices=1024,
         )
         self._sigreg_device = None
-
-    @staticmethod
-    def scalar(value: torch.Tensor) -> float:
-        return value.detach().float().cpu().item()
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
@@ -221,15 +223,15 @@ class WMTrainer(SectionedWandbTrainer):
             target_z = embeddings[:, 1:]
             self.log(
                 {
-                    "loss_total": self.scalar(loss),
-                    "pred_loss": self.scalar(pred_loss),
-                    "sigreg": self.scalar(sigreg_loss),
-                    "z_std_mean": self.scalar(z_std.mean()),
-                    "z_std_min": self.scalar(z_std.min()),
-                    "z_norm_mean": self.scalar(flat_z.norm(dim=-1).mean()),
-                    "pred_std": self.scalar(pred_z.std(dim=(0, 1)).mean()),
-                    "target_std": self.scalar(target_z.std(dim=(0, 1)).mean()),
-                    "pred_target_std_ratio": self.scalar(pred_z.std(dim=(0, 1)).mean() / target_z.std(dim=(0, 1)).mean().clamp_min(1e-6)),
+                    "loss_total": scalar(loss),
+                    "pred_loss": scalar(pred_loss),
+                    "sigreg": scalar(sigreg_loss),
+                    "z_std_mean": scalar(z_std.mean()),
+                    "z_std_min": scalar(z_std.min()),
+                    "z_norm_mean": scalar(flat_z.norm(dim=-1).mean()),
+                    "pred_std": scalar(pred_z.std(dim=(0, 1)).mean()),
+                    "target_std": scalar(target_z.std(dim=(0, 1)).mean()),
+                    "pred_target_std_ratio": scalar(pred_z.std(dim=(0, 1)).mean() / target_z.std(dim=(0, 1)).mean().clamp_min(1e-6)),
                 }
             )
 
@@ -266,9 +268,11 @@ class RewardPolicyTrainer(SectionedWandbTrainer):
         for p in self.wm_model.parameters():
             p.requires_grad = False
 
-    @staticmethod
-    def scalar(value: torch.Tensor) -> float:
-        return value.detach().float().cpu().item()
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad(), self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+        return loss.detach().mean(), None, None
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         dtype = next(self.wm_model.parameters()).dtype
@@ -300,18 +304,18 @@ class RewardPolicyTrainer(SectionedWandbTrainer):
             pred_prob = torch.sigmoid(score)
             self.log(
                 {
-                    "ranking_loss": self.scalar(ranking_loss),
-                    "calibration_loss": self.scalar(calibration_loss),
-                    "dist_mean": self.scalar(dist.mean()),
-                    "dist_std": self.scalar(dist.std()),
-                    "y_mean": self.scalar(y.mean()),
-                    "y_std": self.scalar(y.std()),
-                    "y_min": self.scalar(y.min()),
-                    "y_max": self.scalar(y.max()),
-                    "pred_mean": self.scalar(pred_prob.mean()),
-                    "pred_std": self.scalar(pred_prob.std()),
-                    "logit_mean": self.scalar(score.mean()),
-                    "logit_std": self.scalar(score.std()),
+                    "ranking_loss": scalar(ranking_loss),
+                    "calibration_loss": scalar(calibration_loss),
+                    "dist_mean": scalar(dist.mean()),
+                    "dist_std": scalar(dist.std()),
+                    "y_mean": scalar(y.mean()),
+                    "y_std": scalar(y.std()),
+                    "y_min": scalar(y.min()),
+                    "y_max": scalar(y.max()),
+                    "pred_mean": scalar(pred_prob.mean()),
+                    "pred_std": scalar(pred_prob.std()),
+                    "logit_mean": scalar(score.mean()),
+                    "logit_std": scalar(score.std()),
                 }
             )
 
@@ -554,6 +558,7 @@ def train(
 
     model.eval()
     model.decoder.train()
+    print("Frozen world-model encoder/predictor; training decoder only.", flush=True)
 
     decoder_args = TrainingArguments(
         output_dir=decoder_output_dir,

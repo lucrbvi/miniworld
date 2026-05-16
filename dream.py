@@ -12,7 +12,7 @@ from PIL import Image
 from safetensors.torch import load_file
 from transformers.trainer import load_sharded_checkpoint
 
-from model import Policy, WorldModel, WorldModelConfig
+from model import WorldModel, WorldModelConfig
 
 KEY = rl.KeyboardKey
 MOUSE = rl.MouseButton
@@ -88,7 +88,7 @@ def load_state_dict_checked(model: WorldModel, state_dict: dict[str, torch.Tenso
     except RuntimeError as exc:
         filtered = {k: v for k, v in state_dict.items() if not k.startswith("decoder.")}
         result = model.load_state_dict(filtered, strict=False)
-        optional_prefixes = ("decoder.", "policy.")
+        optional_prefixes = ("decoder.",)
         bad_missing = [k for k in result.missing_keys if not k.startswith(optional_prefixes)]
         bad_unexpected = [k for k in result.unexpected_keys if not k.startswith(optional_prefixes)]
         if bad_missing or bad_unexpected:
@@ -97,23 +97,6 @@ def load_state_dict_checked(model: WorldModel, state_dict: dict[str, torch.Tenso
                 f"Checkpoint {source!r} is not compatible with the WorldModel defined in model.py. "
                 f"First checkpoint keys: {sample_keys}"
             ) from exc
-
-def load_policy(path: str, config: WorldModelConfig, device: str) -> Policy:
-    policy = Policy(config)
-    if os.path.isdir(path):
-        safetensors_path = os.path.join(path, "policy.safetensors")
-        torch_path = os.path.join(path, "policy.pt")
-        if os.path.isfile(safetensors_path):
-            policy.load_state_dict(load_file(safetensors_path, device="cpu"))
-        elif os.path.isfile(torch_path):
-            policy.load_state_dict(torch.load(torch_path, map_location="cpu"))
-        else:
-            raise FileNotFoundError(f"No policy.safetensors/policy.pt found in {path!r}")
-    elif os.path.isfile(path):
-        policy.load_state_dict(load_file(path, device="cpu") if path.endswith(".safetensors") else torch.load(path, map_location="cpu"))
-    else:
-        raise FileNotFoundError(path)
-    return policy.to(device).eval()
 
 def load_world_model(model_path: str, device: str) -> WorldModel:
     if os.path.isdir(model_path):
@@ -221,47 +204,38 @@ def predict_next_frame(
     max_context_len: int,
     device: str,
     amp: bool,
-    policy: Policy | None = None,
-    target_tokens: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, list[list[float]] | torch.Tensor, float | None]:
+) -> tuple[torch.Tensor, torch.Tensor, list[list[float]] | torch.Tensor]:
     if isinstance(actions, list):
         actions = actions[-token_history.size(1) :]
         action_tensor = torch.tensor(actions, device=device, dtype=token_history.dtype).unsqueeze(0)
     else:
         action_tensor = actions
     with autocast_context(device, amp, token_history.dtype == torch.float16):
-        next_tokens = model.predict(token_history, action_tensor)[:, -1]
-        pixel_pred = model.decoder(next_tokens)[0]
-        reward = None
-        if policy is not None and target_tokens is not None:
-            start = token_history[:, 0, 0].float()
-            current = next_tokens[:, 0].float()
-            target = target_tokens[:, 0].float()
-            reward = float(torch.sigmoid(policy(start, current, target)).detach().cpu().item())
+        predicted_tokens = model.predict(token_history, action_tensor)[:, -1]
+        if predicted_tokens.size(1) != model.n_patches + 1:
+            raise ValueError("Predictor must return CLS + all patch tokens for decoding")
+        pixel_pred = model.decoder(predicted_tokens)[0]
 
-    next_tok = next_tokens.unsqueeze(1)
+    next_tok = predicted_tokens.unsqueeze(1)
     if token_history.size(1) < max_context_len:
         token_history = torch.cat([token_history, next_tok], dim=1)
     else:
         token_history = torch.cat([token_history[:, 1:], next_tok], dim=1)
         actions = actions[-max_context_len + 1 :]
-    return pixel_pred, token_history, actions, reward
+    return pixel_pred, token_history, actions
 
-def draw_ui(action: list[float], fps: float, generated_count: int, reward: float | None = None) -> None:
+def draw_ui(action: list[float], fps: float, generated_count: int) -> None:
     active = [name for name, value in zip(ACTION_NAMES, action) if value]
     rl.draw_rectangle(0, 0, 320, 88, rl.fade(rl.BLACK, 0.65))
     rl.draw_text("World Model", 10, 8, 18, rl.RAYWHITE)
     rl.draw_text(f"Frames generated: {generated_count}", 10, 30, 16, rl.LIGHTGRAY)
     rl.draw_text(f"Inputs: {', '.join(active) if active else 'none'}", 10, 52, 16, rl.LIGHTGRAY)
     rl.draw_text(f"Target FPS: {fps:g}", 10, 70, 14, rl.GRAY)
-    if reward is not None:
-        rl.draw_text(f"Reward: {reward:.3f}", 190, 30, 16, rl.LIME)
 
 @torch.inference_mode()
 def run(args: argparse.Namespace) -> None:
     device = args.device or get_device()
     model = load_world_model(args.model, device)
-    policy = load_policy(args.policy, model.config, device) if args.policy else None
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
@@ -272,12 +246,6 @@ def run(args: argparse.Namespace) -> None:
     config = model.config
     frame = load_frame(args.frame, config.height, config.width)
     frame_tensor = frame_to_tensor(frame, device).to(dtype=next(model.parameters()).dtype)
-    target_tokens = None
-    if args.target_frame:
-        target_frame = load_frame(args.target_frame, config.height, config.width)
-        target_tensor = frame_to_tensor(target_frame, device).to(dtype=next(model.parameters()).dtype)
-        target_tokens = encode_frame(model, target_tensor, device, args.amp)
-
     token_history = encode_frame(model, frame_tensor, device, args.amp).unsqueeze(1)
     actions = []
 
@@ -286,7 +254,6 @@ def run(args: argparse.Namespace) -> None:
     texture = make_texture(frame)
 
     generated_count = 0
-    last_reward = None
     last_step_time = rl.get_time()
     frame_interval = 1.0 / args.fps
 
@@ -297,15 +264,13 @@ def run(args: argparse.Namespace) -> None:
 
             if now - last_step_time >= frame_interval:
                 actions.append(action)
-                next_frame, token_history, actions, last_reward = predict_next_frame(
+                next_frame, token_history, actions = predict_next_frame(
                     model,
                     token_history,
                     actions,
                     args.context_len,
                     device,
                     args.amp,
-                    policy,
-                    target_tokens,
                 )
                 frame_tensor = next_frame.to(dtype=next(model.parameters()).dtype)
                 frame = tensor_to_frame(next_frame)
@@ -316,7 +281,7 @@ def run(args: argparse.Namespace) -> None:
             rl.begin_drawing()
             rl.clear_background(rl.BLACK)
             rl.draw_texture_ex(texture, rl.Vector2(0, 0), 0.0, args.scale, rl.WHITE)
-            draw_ui(action, args.fps, generated_count, last_reward)
+            draw_ui(action, args.fps, generated_count)
             rl.end_drawing()
     finally:
         rl.unload_texture(texture)
@@ -326,8 +291,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Play with a trained DOOM world model through a raylib UI.")
     parser.add_argument("--model", default="./checkpoints", help="Checkpoint directory or .safetensors file")
     parser.add_argument("--frame", help="Initial DOOM frame image")
-    parser.add_argument("--policy", default=None, help="Optional reward policy dir/.safetensors/.pt")
-    parser.add_argument("--target-frame", default=None, help="Optional goal frame used to display normalized reward")
     parser.add_argument("--context-len", type=int, default=10)
     parser.add_argument("--fps", type=float, default=1.0, help="World-model prediction rate")
     parser.add_argument("--scale", type=int, default=2, help="Window scale factor")

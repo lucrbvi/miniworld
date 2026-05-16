@@ -137,19 +137,24 @@ class Decoder(nn.Module):
         self.grid_w = config.width // config.patch_size
         self.n_patches = self.grid_h * self.grid_w
         patch_dim = config.patch_size * config.patch_size * 3
+        hidden = config.dim * config.decoder_hidden_mult
 
         self.pos = nn.Parameter(torch.randn(1, self.n_patches, config.dim) * 0.02)
-        self.blocks = TransformerStack(
-            config.dim,
-            config.n_heads,
-            config.decoder_blocks,
-            config.ffn_mult,
-            config.dropout_proba,
-            causal=False,
+        self.from_state = nn.Sequential(
+            nn.LayerNorm(config.dim),
+            nn.Linear(config.dim, config.dim),
+            nn.SiLU(),
         )
-        self.to_patch = nn.Linear(config.dim, patch_dim)
+        self.to_patch = nn.Sequential(
+            nn.LayerNorm(config.dim),
+            nn.Linear(config.dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, patch_dim),
+        )
 
     def forward(self, tokens: Tensor) -> Tensor:
+        if tokens.dim() == 2:
+            tokens = self.from_state(tokens).unsqueeze(1).expand(-1, self.n_patches, -1)
         if tokens.dim() == 4:
             b, t, n, d = tokens.shape
             tokens = tokens.reshape(b * t, n, d)
@@ -158,8 +163,7 @@ class Decoder(nn.Module):
         if tokens.size(1) != self.n_patches:
             raise ValueError(f"Decoder expected {self.n_patches} patch tokens, got {tokens.size(1)}")
 
-        x = self.blocks(tokens + self.pos.to(dtype=tokens.dtype))
-        patches = self.to_patch(x)
+        patches = self.to_patch(tokens + self.pos.to(dtype=tokens.dtype))
         p = self.patch_size
         img = patches.view(tokens.size(0), self.grid_h, self.grid_w, 3, p, p)
         img = img.permute(0, 3, 1, 4, 2, 5).contiguous()
@@ -176,7 +180,10 @@ class WorldModelConfig(PretrainedConfig):
         dim: int = 256,
         n_heads: int = 4,
         n_blocks: int = 3,
-        decoder_blocks: int = 2,
+        decoder_hidden_mult: int = 4,
+        decoder_noise_std: float = 0.05,
+        decoder_pred_token_ratio: float = 0.5,
+        decoder_curriculum_end: float = 0.8,
         ffn_mult: int = 3,
         dropout_proba: float = 0.1,
         causal: bool = True,
@@ -191,7 +198,10 @@ class WorldModelConfig(PretrainedConfig):
         self.dim = dim
         self.n_heads = n_heads
         self.n_blocks = n_blocks
-        self.decoder_blocks = decoder_blocks
+        self.decoder_hidden_mult = decoder_hidden_mult
+        self.decoder_noise_std = decoder_noise_std
+        self.decoder_pred_token_ratio = decoder_pred_token_ratio
+        self.decoder_curriculum_end = decoder_curriculum_end
         self.ffn_mult = ffn_mult
         self.dropout_proba = dropout_proba
         self.causal = causal

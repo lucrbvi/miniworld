@@ -149,13 +149,9 @@ class Decoder(nn.Module):
         patch_dim = config.patch_size * config.patch_size * 3
         hidden = config.dim * config.decoder_hidden_mult
 
-        self.pos = nn.Parameter(torch.randn(1, self.n_patches, config.dim) * 0.02)
-        self.from_state = nn.Sequential(
-            nn.LayerNorm(config.dim),
-            nn.Linear(config.dim, config.dim),
-            nn.SiLU(),
-        )
-        self.spatial_blocks = TransformerStack(
+        self.state_to_tokens = nn.Linear(config.dim, config.dim * self.n_patches)
+        self.pos = nn.Parameter(torch.randn(1, self.n_patches + 1, config.dim) * 0.02)
+        self.blocks = TransformerStack(
             config.dim,
             config.n_heads,
             max(1, config.decoder_n_blocks),
@@ -172,16 +168,18 @@ class Decoder(nn.Module):
 
     def forward(self, tokens: Tensor) -> Tensor:
         if tokens.dim() == 2:
-            tokens = self.from_state(tokens).unsqueeze(1).expand(-1, self.n_patches, -1)
+            tokens = self.state_to_tokens(tokens).view(tokens.size(0), self.n_patches, -1)
         if tokens.dim() == 4:
             b, t, n, d = tokens.shape
             tokens = tokens.reshape(b * t, n, d)
-        if tokens.size(1) == self.n_patches + 1:
-            tokens = tokens[:, 1:]
-        if tokens.size(1) != self.n_patches:
-            raise ValueError(f"Decoder expected {self.n_patches} patch tokens, got {tokens.size(1)}")
+        if tokens.size(1) == self.n_patches:
+            cls = tokens.mean(dim=1, keepdim=True)
+            tokens = torch.cat([cls, tokens], dim=1)
+        if tokens.size(1) != self.n_patches + 1:
+            raise ValueError(f"Decoder expected {self.n_patches} patch tokens (+ optional CLS), got {tokens.size(1)}")
 
-        tokens = self.spatial_blocks(tokens + self.pos.to(dtype=tokens.dtype))
+        tokens = tokens + self.pos.to(dtype=tokens.dtype)
+        tokens = self.blocks(tokens)[:, 1:]
         patches = self.to_patch(tokens)
         p = self.patch_size
         img = patches.view(tokens.size(0), self.grid_h, self.grid_w, 3, p, p)
@@ -200,7 +198,7 @@ class WorldModelConfig(PretrainedConfig):
         n_heads: int = 4,
         n_blocks: int = 3,
         decoder_hidden_mult: int = 4,
-        decoder_n_blocks: int = 2,
+        decoder_n_blocks: int = 4,
         decoder_noise_std: float = 0.05,
         decoder_pred_token_ratio: float = 0.5,
         decoder_curriculum_end: float = 0.8,

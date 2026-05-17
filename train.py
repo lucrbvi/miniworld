@@ -128,10 +128,11 @@ def scalar(value: torch.Tensor) -> float:
 class DecoderTrainer(SectionedWandbTrainer):
     wandb_section = "decoder"
 
-    def __init__(self, *args, lpips_weight: float = 0.1, rollout_weight: float = 1.0, **kwargs):
+    def __init__(self, *args, lpips_weight: float = 0.1, rollout_weight: float = 1.0, rollout_decode_steps: int = 2, **kwargs):
         super().__init__(*args, **kwargs)
         self.lpips_weight = lpips_weight
         self.rollout_weight = rollout_weight
+        self.rollout_decode_steps = rollout_decode_steps
         self.lpips_loss = lpips.LPIPS(net="alex").eval()
         for param in self.lpips_loss.parameters():
             param.requires_grad = False
@@ -165,6 +166,12 @@ class DecoderTrainer(SectionedWandbTrainer):
                 rollout_latents.append(next_tokens)
                 rollout_tokens = torch.cat([rollout_tokens, next_tokens.unsqueeze(1)], dim=1)
             rollout_latents = torch.stack(rollout_latents, dim=1)
+            if self.rollout_decode_steps > 0 and rollout_latents.size(1) > self.rollout_decode_steps:
+                step_idx = torch.randperm(rollout_latents.size(1), device=rollout_latents.device)[: self.rollout_decode_steps].sort().values
+                rollout_latents = rollout_latents[:, step_idx]
+                rollout_target = observations[:, 1:][:, step_idx]
+            else:
+                rollout_target = observations[:, 1:]
             if self.state.max_steps <= 0:
                 progress = 0.0
             else:
@@ -179,12 +186,11 @@ class DecoderTrainer(SectionedWandbTrainer):
 
         recon = model.decoder(decoder_latents)
         rollout_recon = model.decoder(rollout_latents)
-        rollout_target = observations[:, 1:].reshape(-1, *observations.shape[2:])
+        rollout_target = rollout_target.reshape(-1, *observations.shape[2:])
         l1_loss = F.l1_loss(recon.float(), target_frame.float())
         rollout_l1_loss = F.l1_loss(rollout_recon.float(), rollout_target.float())
         lpips_loss = self.lpips_loss(recon.float() * 2 - 1, target_frame.float() * 2 - 1).mean()
-        rollout_lpips_loss = self.lpips_loss(rollout_recon.float() * 2 - 1, rollout_target.float() * 2 - 1).mean()
-        loss = l1_loss + self.rollout_weight * rollout_l1_loss + self.lpips_weight * (lpips_loss + self.rollout_weight * rollout_lpips_loss)
+        loss = l1_loss + self.rollout_weight * rollout_l1_loss + self.lpips_weight * lpips_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
             self.log(
@@ -193,9 +199,9 @@ class DecoderTrainer(SectionedWandbTrainer):
                     "l1": scalar(l1_loss),
                     "rollout_l1": scalar(rollout_l1_loss),
                     "lpips": scalar(lpips_loss),
-                    "rollout_lpips": scalar(rollout_lpips_loss),
                     "pred_token_ratio": pred_ratio,
                     "used_pred_token_ratio": scalar(use_pred.float().mean()),
+                    "rollout_decode_steps": rollout_latents.size(1),
                     "latent_noise_std": model.config.decoder_noise_std,
                 }
             )
@@ -245,32 +251,34 @@ class WMTrainer(SectionedWandbTrainer):
             rollout_tokens = torch.cat([rollout_tokens, next_preds.unsqueeze(1)], dim=1)
         rollout_preds = torch.stack(rollout_preds, dim=1)
 
+        target_tokens = tokens[:, 1:]
         sigreg_loss = torch.stack(
-            [self.sigreg(embeddings[:, t].float()) for t in range(embeddings.size(1))]
+            [self.sigreg(tokens[:, t].reshape(-1, tokens.size(-1)).float()) for t in range(tokens.size(1))]
         ).mean()
-        pred_loss = F.mse_loss(pred_tokens[:, :, 0].float(), embeddings[:, 1:].float())
-        token_pred_loss = F.mse_loss(pred_tokens.float(), tokens[:, 1:].float())
+        pred_loss = F.mse_loss(pred_tokens.float(), target_tokens.float())
         rollout_loss = F.mse_loss(rollout_preds.float(), tokens[:, 1 : 1 + rollout_len].float())
-        loss = pred_loss + token_pred_loss + rollout_loss + self.sigreg_weight * sigreg_loss
+        loss = pred_loss + rollout_loss + self.sigreg_weight * sigreg_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
-            flat_z = embeddings.flatten(0, 1)
+            flat_z = tokens.flatten(0, 2)
             z_std = flat_z.std(dim=0)
-            pred_z = pred_tokens[:, :, 0]
-            target_z = embeddings[:, 1:]
+            pred_z = pred_tokens.flatten(0, 2)
+            target_z = target_tokens.flatten(0, 2)
+            patch_tokens = tokens[:, :, 1:]
+            patch_spatial_std = patch_tokens.std(dim=2).mean()
             self.log(
                 {
                     "loss_total": scalar(loss),
                     "pred_loss": scalar(pred_loss),
-                    "token_pred_loss": scalar(token_pred_loss),
                     "rollout_loss": scalar(rollout_loss),
                     "sigreg": scalar(sigreg_loss),
                     "z_std_mean": scalar(z_std.mean()),
                     "z_std_min": scalar(z_std.min()),
                     "z_norm_mean": scalar(flat_z.norm(dim=-1).mean()),
-                    "pred_std": scalar(pred_z.std(dim=(0, 1)).mean()),
-                    "target_std": scalar(target_z.std(dim=(0, 1)).mean()),
-                    "pred_target_std_ratio": scalar(pred_z.std(dim=(0, 1)).mean() / target_z.std(dim=(0, 1)).mean().clamp_min(1e-6)),
+                    "patch_spatial_std": scalar(patch_spatial_std),
+                    "pred_std": scalar(pred_z.std(dim=0).mean()),
+                    "target_std": scalar(target_z.std(dim=0).mean()),
+                    "pred_target_std_ratio": scalar(pred_z.std(dim=0).mean() / target_z.std(dim=0).mean().clamp_min(1e-6)),
                 }
             )
 
@@ -343,13 +351,12 @@ class RewardModelTrainer(SectionedWandbTrainer):
         rank_label = (i > j).float()
         ranking_loss = F.binary_cross_entropy_with_logits(rank_logit, rank_label)
 
-        flat_current = candidate_tokens.reshape(batch_size * steps, *candidate_tokens.shape[2:])
-        flat_start = start[:, None].expand(-1, steps, -1, -1).reshape_as(flat_current)
-        flat_goal = goal[:, None].expand(-1, steps, -1, -1).reshape_as(flat_current)
-        flat_score = model(flat_start.float(), flat_current.float(), flat_goal.float())
-        steps_to_goal = torch.arange(steps - 1, -1, -1, device=real_tokens.device, dtype=torch.float32)
-        y = torch.exp(-steps_to_goal / self.reward_tau).repeat(batch_size)
-        calibration_loss = F.binary_cross_entropy_with_logits(flat_score, y)
+        calib_idx = torch.randint(0, steps, (batch_size,), device=real_tokens.device)
+        calib_current = candidate_tokens[batch_idx, calib_idx]
+        calib_score = model(start.float(), calib_current.float(), goal.float())
+        steps_to_goal = (steps - 1 - calib_idx).float()
+        y = torch.exp(-steps_to_goal / self.reward_tau)
+        calibration_loss = F.binary_cross_entropy_with_logits(calib_score, y)
 
         wrong_goal = goal.roll(1, dims=0)
         wrong_score = model(start.float(), candidate_tokens[:, -1].float(), wrong_goal.float())
@@ -357,7 +364,7 @@ class RewardModelTrainer(SectionedWandbTrainer):
         loss = ranking_loss + 0.05 * calibration_loss + 0.01 * negative_goal_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
-            score = torch.cat([score_i, score_j, flat_score, wrong_score])
+            score = torch.cat([score_i, score_j, calib_score, wrong_score])
             self.log(
                 {
                     "ranking_loss": scalar(ranking_loss),
@@ -536,8 +543,8 @@ def train(
         reward_model_args = TrainingArguments(
             output_dir=reward_model_output_dir,
             num_train_epochs=1,
-            per_device_train_batch_size=args.per_device_train_batch_size * 5,
-            per_device_eval_batch_size=args.per_device_eval_batch_size * 5,
+            per_device_train_batch_size=args.per_device_train_batch_size,
+            per_device_eval_batch_size=args.per_device_eval_batch_size,
             learning_rate=1e-4,
             weight_decay=1e-4,
             max_grad_norm=1.0,
@@ -622,8 +629,8 @@ def train(
     reward_model_args = TrainingArguments(
         output_dir=reward_model_output_dir,
         num_train_epochs=1,
-        per_device_train_batch_size=args.per_device_train_batch_size * 5,
-        per_device_eval_batch_size=args.per_device_eval_batch_size * 5,
+        per_device_train_batch_size=max(1, args.per_device_train_batch_size // 4),
+        per_device_eval_batch_size=max(1, args.per_device_eval_batch_size // 4),
         learning_rate=1e-4,
         weight_decay=1e-4,
         max_grad_norm=1.0,

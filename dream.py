@@ -86,6 +86,8 @@ def load_state_dict_checked(model: WorldModel, state_dict: dict[str, torch.Tenso
     try:
         model.load_state_dict(state_dict)
     except RuntimeError as exc:
+        if "decoder" in Path(source).parts:
+            raise
         filtered = {k: v for k, v in state_dict.items() if not k.startswith("decoder.")}
         result = model.load_state_dict(filtered, strict=False)
         optional_prefixes = ("decoder.",)

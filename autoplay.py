@@ -1,19 +1,17 @@
 import argparse
 import os
-from contextlib import nullcontext
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 import vizdoom as vzd
 from dotenv import load_dotenv
 from PIL import Image
 from safetensors.torch import load_file
 
-from dream import ACTION_NAMES, get_device, load_frame, load_world_model
-from model import RewardModel, WorldModel
+from dream import ACTION_NAMES, get_device, load_world_model
+from model import ActionPolicy, WorldModel
 
 BUTTONS = [
     vzd.Button.MOVE_FORWARD, vzd.Button.MOVE_BACKWARD, vzd.Button.MOVE_LEFT,
@@ -21,128 +19,42 @@ BUTTONS = [
     vzd.Button.ATTACK, vzd.Button.USE, vzd.Button.SPEED,
 ]
 
-def autocast(device: str, enabled: bool):
-    return torch.autocast(device_type="cuda", dtype=torch.bfloat16) if enabled and device == "cuda" else nullcontext()
-
-def encode(model: WorldModel, frame: np.ndarray, device: str, amp: bool) -> torch.Tensor:
-    x = torch.from_numpy(np.transpose(frame, (2, 0, 1)).copy()).to(device=device, dtype=torch.float32) / 255.0
-    with torch.no_grad(), autocast(device, amp):
-        _, tokens = model.encode(x[None, None], return_tokens=True)
-    return tokens[:, 0].float().detach().clone()
-
-def discretize_action(values: torch.Tensor, threshold: float) -> list[int]:
-    a = values.detach().cpu().tolist()
-    action = [0] * len(ACTION_NAMES)
-    for i, j in ((0, 1), (2, 3), (4, 5)):
-        if max(a[i], a[j]) >= threshold:
-            action[i if a[i] >= a[j] else j] = 1
-    action[6:] = [int(a[i] >= threshold) for i in range(6, 9)]
-    return action
-
-def load_reward_model(path: str, config, device: str) -> RewardModel:
-    reward_model = RewardModel(config)
+def load_action_policy(path: str, config, device: str) -> ActionPolicy:
+    ap = ActionPolicy(config.dim)
     if os.path.isdir(path):
-        candidates = ["reward_model.safetensors", "model.safetensors"]
-        reward_model_path = next((os.path.join(path, name) for name in candidates if os.path.isfile(os.path.join(path, name))), None)
-        if reward_model_path is None:
-            raise FileNotFoundError(f"Reward model not found in {path!r}")
+        candidates = ["model.safetensors", "pytorch_model.bin"]
+        ap_path = next((os.path.join(path, name) for name in candidates if os.path.isfile(os.path.join(path, name))), None)
+        if ap_path is None:
+            raise FileNotFoundError(f"ActionPolicy not found in {path!r}")
     elif os.path.isfile(path):
-        reward_model_path = path
+        ap_path = path
     else:
-        raise FileNotFoundError(f"Reward model not found: {path!r}")
-    reward_model.load_state_dict(
-        load_file(reward_model_path, device="cpu") if reward_model_path.endswith(".safetensors")
-        else torch.load(reward_model_path, map_location="cpu")
-    )
-    reward_model.to(device=device).eval()
-    for p in reward_model.parameters():
+        raise FileNotFoundError(f"ActionPolicy not found: {path!r}")
+    sd = load_file(ap_path, device="cpu") if ap_path.endswith(".safetensors") else torch.load(ap_path, map_location="cpu")
+    ap.load_state_dict(sd)
+    ap.to(device=device).eval()
+    for p in ap.parameters():
         p.requires_grad_(False)
-    return reward_model
+    return ap
 
-def plan(model: WorldModel, reward_model: RewardModel | None, token_history: torch.Tensor, action_history: torch.Tensor, target: torch.Tensor, previous_logits: torch.Tensor | None, args: argparse.Namespace, device: str) -> tuple[list[int], torch.Tensor, float]:
-    n_actions = len(ACTION_NAMES)
-    if previous_logits is not None and previous_logits.shape == (args.candidates, args.horizon, n_actions):
-        shifted = torch.cat([previous_logits[:, 1:].detach(), torch.randn(args.candidates, 1, n_actions, device=device)], dim=1)
-        logits = shifted.clone()
-    else:
-        logits = torch.randn(args.candidates, args.horizon, n_actions, device=device)
-    logits.requires_grad_(True)
-    opt = torch.optim.AdamW([logits], lr=args.lr)
-
-    best_reward = torch.full((), -float("inf"), device=device)
-    best_idx = 0
-    for _ in range(args.iters):
-        opt.zero_grad(set_to_none=True)
-        actions = torch.sigmoid(logits)
-        tokens = token_history.expand(args.candidates, -1, -1, -1)
-        base_actions = action_history.expand(args.candidates, -1, -1)
-        rewards = []
-        with autocast(device, args.amp):
-            for t in range(args.horizon):
-                act = torch.cat([base_actions[:, :-1], actions[:, : t + 1]], dim=1)
-                act = act[:, -tokens.size(1):]
-                pred = model.predict(tokens, act.to(tokens.dtype))[:, -1]
-                current = pred.float()
-                goal = target.expand(args.candidates, -1, -1).float()
-                if reward_model is None:
-                    reward = -((current - goal) ** 2).mean(dim=-1)
-                else:
-                    start = token_history[:, 0].expand(args.candidates, -1, -1).float()
-                    reward = torch.sigmoid(reward_model(start, current.float(), goal.float()))
-                rewards.append(reward * (args.gamma ** t))
-                tokens = torch.cat([tokens, pred.unsqueeze(1)], dim=1)
-            returns = torch.stack(rewards, dim=1).sum(dim=1)
-            loss = -returns.mean()
-        loss.backward()
-        opt.step()
-        best_reward, best_idx_tensor = returns.detach().max(dim=0)
-        best_idx = int(best_idx_tensor.cpu())
-
-    first_action = torch.sigmoid(logits.detach()[best_idx, 0])
-    return discretize_action(first_action, args.threshold), logits.detach().clone(), float(best_reward.cpu())
-
-def _draw_reward_graph(frame: np.ndarray, reward_history: list[float], max_len: int = 150) -> None:
-    h, w = frame.shape[:2]
-    gw, gh = min(220, w // 3), min(90, h // 5)
-    pad = 8
-    x0, y0 = pad, h - gh - pad
-    x1, y1 = x0 + gw, y0 + gh
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
-    cv2.rectangle(frame, (x0, y0), (x1, y1), (100, 100, 100), 1)
-    recent = reward_history[-max_len:]
-    n = len(recent)
-    if n < 2:
-        cv2.putText(frame, f"{reward_history[-1]:.3f}", (x0 + 4, y0 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
-        return
-    vmin, vmax = min(recent), max(recent)
-    if vmax - vmin < 1e-6:
-        vmin, vmax = vmin - 0.5, vmax + 0.5
-    margin = max(0.05 * (vmax - vmin), 0.01)
-    vmin, vmax = vmin - margin, vmax + margin
-
-    def _px(i, v):
-        px = x0 + 3 + (i / (n - 1)) * (gw - 6)
-        py = y1 - 3 - ((v - vmin) / (vmax - vmin)) * (gh - 10)
-        return int(px), int(py)
-
-    for i in range(n - 1):
-        cv2.line(frame, _px(i, recent[i]), _px(i + 1, recent[i + 1]), (0, 230, 130), 2)
-    cv2.putText(frame, f"{vmax:.2f}", (x0 + 3, y0 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (140, 140, 140), 1)
-    cv2.putText(frame, f"{vmin:.2f}", (x0 + 3, y1 - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (140, 140, 140), 1)
-    cv2.putText(frame, f"{recent[-1]:.3f}", (x1 - 52, y0 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 150), 1)
+@torch.inference_mode()
+def encode_frame(model: WorldModel, frame: np.ndarray, device: str, dtype: torch.dtype) -> torch.Tensor:
+    x = torch.from_numpy(np.transpose(frame, (2, 0, 1)).copy()).to(device=device, dtype=dtype) / 255.0
+    return model.encode(x[None, None])[:, 0]
 
 def run(args: argparse.Namespace) -> None:
     load_dotenv()
     args.wad = args.wad or os.getenv("DOOM_WAD_PATH")
     device = args.device or get_device()
-    model = load_world_model(args.model, device).eval()
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+    dtype = torch.bfloat16 if device == "cuda" and not args.fp32 else torch.float32
+    model = load_world_model(args.model, device).to(dtype=dtype).eval()
     for p in model.parameters():
         p.requires_grad_(False)
-    cfg = model.config
-    target = encode(model, load_frame(args.target_frame, cfg.height, cfg.width), device, args.amp)
-    reward_model = load_reward_model(args.reward_model, model.config, device) if args.reward_model else None
+    ap = load_action_policy(args.action_policy, model.config, device).to(dtype=dtype)
+
     game = vzd.DoomGame()
     if args.wad:
         game.set_doom_game_path(args.wad)
@@ -163,43 +75,45 @@ def run(args: argparse.Namespace) -> None:
     game.set_mode(vzd.Mode.PLAYER)
     game.add_game_args(f"+skill {args.skill}")
     game.init()
-    last_plan = token_history = video = None
-    action_history: list[list[int]] = []
-    reward_history: list[float] = []
+
+    video = None
     try:
         game.new_episode()
         step = 0
         while not game.is_episode_finished() and step < args.max_steps:
             state = game.get_state()
             raw = state.screen_buffer.copy()
-            if reward_history:
-                _draw_reward_graph(raw, reward_history)
-            cv2.imshow("miniworld - Reward Graph", cv2.cvtColor(raw, cv2.COLOR_RGB2BGR))
+
+            h, w = model.config.height, model.config.width
+            if raw.shape[:2] != (h, w):
+                frame = np.asarray(Image.fromarray(raw).resize((w, h), Image.Resampling.BILINEAR))
+            else:
+                frame = raw
+
+            cls_token = encode_frame(model, frame, device, dtype)
+            logits = ap(cls_token)
+            action = (torch.sigmoid(logits) > args.threshold).int()[0].cpu().tolist()
+
+            active = [name for name, val in zip(ACTION_NAMES, action) if val]
+            overlay = f"step={step} action={' '.join(active) if active else 'none'}"
+            cv2.putText(raw, overlay, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 150), 2)
+            cv2.imshow("miniworld - Autoplay", cv2.cvtColor(raw, cv2.COLOR_RGB2BGR))
             cv2.waitKey(1)
+
             if args.record:
                 if video is None:
                     Path(args.record).parent.mkdir(parents=True, exist_ok=True)
-                    h, w = raw.shape[:2]
-                    video = cv2.VideoWriter(args.record, cv2.VideoWriter_fourcc(*"mp4v"), args.record_fps, (w, h))
-                    if not video.isOpened():
-                        raise RuntimeError(f"Could not open video writer: {args.record}")
+                    h_raw, w_raw = raw.shape[:2]
+                    video = cv2.VideoWriter(args.record, cv2.VideoWriter_fourcc(*"mp4v"), args.record_fps, (w_raw, h_raw))
                 bgr = cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
                 for _ in range(args.frame_skip):
                     video.write(bgr)
-            frame = raw if raw.shape[:2] == (cfg.height, cfg.width) else np.asarray(Image.fromarray(raw).resize((cfg.width, cfg.height), Image.Resampling.BILINEAR))
-            current = encode(model, frame, device, args.amp)
-            token_history = current.unsqueeze(1) if token_history is None else torch.cat([token_history, current.unsqueeze(1)], dim=1)
-            action_history.append([0] * len(ACTION_NAMES))
-            token_history = token_history[:, -args.context_len:]
-            action_history = action_history[-token_history.size(1):]
-            action_tensor = torch.tensor(action_history, device=device, dtype=torch.float32).unsqueeze(0)
-            action, last_plan, reward = plan(model, reward_model, token_history, action_tensor, target, last_plan, args, device)
-            reward_history.append(reward)
-            action_history[-1] = action
+
             game.make_action(action, args.frame_skip)
+
             if args.log_every and step % args.log_every == 0:
-                active = [name for name, value in zip(ACTION_NAMES, action) if value]
-                print(f"step={step:05d} reward_sum={reward:.4f} reward_avg={reward / args.horizon:.4f} action={active or ['none']}", flush=True)
+                print(f"step={step:05d} action={' '.join(active) if active else 'none'}", flush=True)
+
             step += 1
     finally:
         cv2.destroyAllWindows()
@@ -209,39 +123,25 @@ def run(args: argparse.Namespace) -> None:
         game.close()
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Minimal gradient-based VizDOOM autoplay with a world model.")
+    parser = argparse.ArgumentParser(description="Play DOOM with a world model and learned action policy.")
     parser.add_argument("--model", default="./checkpoints/world-model")
-    parser.add_argument("--target-frame", required=True)
+    parser.add_argument("--action-policy", default="./checkpoints/action-policy")
     parser.add_argument("--wad", default=None)
     parser.add_argument("--map", default="E1M1")
     parser.add_argument("--skill", type=int, default=1)
     parser.add_argument("--scale", type=int, default=2)
-    parser.add_argument("--context-len", type=int, default=4)
-    parser.add_argument("--horizon", type=int, default=3)
-    parser.add_argument("--iters", type=int, default=8)
-    parser.add_argument("--candidates", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=0.25)
     parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--reward-model", default=None)
     parser.add_argument("--frame-skip", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--record", default=None)
     parser.add_argument("--record-fps", type=float, default=35.0)
     parser.add_argument("--device", choices=["cpu", "mps", "cuda"], default=None)
-    parser.add_argument("--no-amp", dest="amp", action="store_false")
+    parser.add_argument("--fp32", action="store_true")
     parser.add_argument("--headless", action="store_true")
-    parser.set_defaults(amp=True)
     args = parser.parse_args()
-    if not Path(args.target_frame).is_file():
-        raise FileNotFoundError(args.target_frame)
     if args.wad is not None and not Path(args.wad).is_file():
         raise FileNotFoundError(args.wad)
-    if min(args.context_len, args.horizon, args.iters, args.candidates, args.frame_skip, args.scale) < 1:
-        raise ValueError("context-len, horizon, iters, candidates, frame-skip and scale must be >= 1")
-    if not 0 <= args.gamma <= 1:
-        raise ValueError("gamma must be in [0, 1]")
     return args
 
 if __name__ == "__main__":

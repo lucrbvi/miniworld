@@ -50,24 +50,18 @@ class TransformerStack(nn.Module):
             x = x + mlp(norm2(x))
         return self.norm(x)
 
-class RewardModel(nn.Module):
-    def __init__(self, config: "WorldModelConfig"):
+class ActionPolicy(nn.Module):
+    def __init__(self, dim: int, action_dim: int = 9, hidden_dim: int = 256):
         super().__init__()
-        dim = config.dim
-        self.value_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-        self.type_pos = nn.Parameter(torch.randn(1, 3, 1, dim) * 0.02)
-        self.blocks = TransformerStack(dim, config.n_heads, 2, config.ffn_mult, config.dropout_proba)
-        self.head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, 1))
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, action_dim),
+        )
 
-    def forward(self, start: Tensor, current: Tensor, goal: Tensor) -> Tensor:
-        if start.dim() == 2: start = start.unsqueeze(1)
-        if current.dim() == 2: current = current.unsqueeze(1)
-        if goal.dim() == 2: goal = goal.unsqueeze(1)
-        x = torch.cat([
-            self.value_token.expand(start.size(0), -1, -1),
-            start + self.type_pos[:, 0], current + self.type_pos[:, 1], goal + self.type_pos[:, 2],
-        ], dim=1)
-        return self.head(self.blocks(x)[:, 0]).squeeze(-1)
+    def forward(self, latent: Tensor) -> Tensor:
+        return self.net(latent)
 
 class ViTEncoder(nn.Module):
     def __init__(self, config: "WorldModelConfig"):

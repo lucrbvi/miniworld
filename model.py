@@ -9,79 +9,12 @@ class MLP(nn.Module):
         hidden_dim = hidden_dim or dim * 4
         out_dim = out_dim or dim
         self.net = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, out_dim),
-            nn.Dropout(dropout),
+            nn.Linear(dim, hidden_dim), nn.SiLU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim, out_dim), nn.Dropout(dropout),
         )
 
     def forward(self, x: Tensor) -> Tensor:
         return self.net(x)
-
-class RewardModel(nn.Module):
-    def __init__(self, config: "WorldModelConfig"):
-        super().__init__()
-        dim = config.dim
-        self.value_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-        self.type_pos = nn.Parameter(torch.randn(1, 3, 1, dim) * 0.02)
-        self.blocks = TransformerStack(dim, config.n_heads, 2, config.ffn_mult, config.dropout_proba, causal=False)
-        self.head = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, dim),
-            nn.SiLU(),
-            nn.Linear(dim, 1),
-        )
-
-    def forward(self, start: Tensor, current: Tensor, goal: Tensor) -> Tensor:
-        if start.dim() == 2:
-            start = start.unsqueeze(1)
-        if current.dim() == 2:
-            current = current.unsqueeze(1)
-        if goal.dim() == 2:
-            goal = goal.unsqueeze(1)
-        start = start + self.type_pos[:, 0]
-        current = current + self.type_pos[:, 1]
-        goal = goal + self.type_pos[:, 2]
-        value = self.value_token.expand(start.size(0), -1, -1)
-        x = torch.cat([value, start, current, goal], dim=1)
-        x = self.blocks(x)
-        return self.head(x[:, 0]).squeeze(-1)
-
-class TransformerBlock(nn.Module):
-    def __init__(self, dim: int, n_heads: int, ffn_mult: int = 4, dropout: float = 0.0, causal: bool = False):
-        super().__init__()
-        self.causal = causal
-        self.attn_norm = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, n_heads, dropout=dropout, batch_first=True)
-        self.mlp_norm = nn.LayerNorm(dim)
-        self.mlp = MLP(dim, dim * ffn_mult, dropout=dropout)
-
-    def forward(self, x: Tensor) -> Tensor:
-        attn_mask = None
-        if self.causal:
-            n = x.size(1)
-            attn_mask = torch.triu(
-                torch.full((n, n), float("-inf"), device=x.device, dtype=x.dtype),
-                diagonal=1,
-            )
-        h = self.attn_norm(x)
-        x = x + self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)[0]
-        x = x + self.mlp(self.mlp_norm(x))
-        return x
-
-class TransformerStack(nn.Module):
-    def __init__(self, dim: int, n_heads: int, n_blocks: int, ffn_mult: int, dropout: float, causal: bool = False):
-        super().__init__()
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(dim, n_heads, ffn_mult, dropout, causal) for _ in range(n_blocks)]
-        )
-        self.norm = nn.LayerNorm(dim)
-
-    def forward(self, x: Tensor) -> Tensor:
-        for block in self.blocks:
-            x = block(x)
-        return self.norm(x)
 
 class Projector(nn.Module):
     def __init__(self, dim: int, hidden_mult: int = 4, dropout: float = 0.0):
@@ -92,121 +25,130 @@ class Projector(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return x + self.mlp(self.norm(x))
 
+class TransformerStack(nn.Module):
+    def __init__(self, dim: int, n_heads: int, n_blocks: int, ffn_mult: int, dropout: float, causal: bool = False):
+        super().__init__()
+        self.blocks = nn.ModuleList()
+        for _ in range(n_blocks):
+            self.blocks.append(nn.ModuleList([
+                nn.LayerNorm(dim),
+                nn.MultiheadAttention(dim, n_heads, dropout=dropout, batch_first=True),
+                nn.LayerNorm(dim),
+                MLP(dim, dim * ffn_mult, dim, dropout),
+            ]))
+        self.norm = nn.LayerNorm(dim)
+        self.causal = causal
+
+    def forward(self, x: Tensor) -> Tensor:
+        for norm1, attn, norm2, mlp in self.blocks:
+            attn_mask = None
+            if self.causal:
+                n = x.size(1)
+                attn_mask = torch.triu(torch.full((n, n), float("-inf"), device=x.device, dtype=x.dtype), diagonal=1)
+            h = norm1(x)
+            x = x + attn(h, h, h, attn_mask=attn_mask, need_weights=False)[0]
+            x = x + mlp(norm2(x))
+        return self.norm(x)
+
+class RewardModel(nn.Module):
+    def __init__(self, config: "WorldModelConfig"):
+        super().__init__()
+        dim = config.dim
+        self.value_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.type_pos = nn.Parameter(torch.randn(1, 3, 1, dim) * 0.02)
+        self.blocks = TransformerStack(dim, config.n_heads, 2, config.ffn_mult, config.dropout_proba)
+        self.head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, 1))
+
+    def forward(self, start: Tensor, current: Tensor, goal: Tensor) -> Tensor:
+        if start.dim() == 2: start = start.unsqueeze(1)
+        if current.dim() == 2: current = current.unsqueeze(1)
+        if goal.dim() == 2: goal = goal.unsqueeze(1)
+        x = torch.cat([
+            self.value_token.expand(start.size(0), -1, -1),
+            start + self.type_pos[:, 0], current + self.type_pos[:, 1], goal + self.type_pos[:, 2],
+        ], dim=1)
+        return self.head(self.blocks(x)[:, 0]).squeeze(-1)
+
 class ViTEncoder(nn.Module):
     def __init__(self, config: "WorldModelConfig"):
         super().__init__()
         self.patch_size = config.patch_size
-        self.grid_h = config.height // config.patch_size
-        self.grid_w = config.width // config.patch_size
-        self.n_patches = self.grid_h * self.grid_w
+        self.n_patches = (config.height // config.patch_size) * (config.width // config.patch_size)
         self.patchify = nn.Conv2d(3, config.dim, kernel_size=config.patch_size, stride=config.patch_size)
         self.cls_token = nn.Parameter(torch.randn(1, 1, config.dim) * 0.02)
         self.pos = nn.Parameter(torch.randn(1, self.n_patches + 1, config.dim) * 0.02)
-        self.blocks = TransformerStack(config.dim, config.n_heads, config.n_blocks, config.ffn_mult, config.dropout_proba, causal=False)
+        self.blocks = TransformerStack(config.dim, config.n_heads, config.n_blocks, config.ffn_mult, config.dropout_proba)
         self.projector = Projector(config.dim)
 
     def forward(self, frames: Tensor) -> Tensor:
         patches = self.patchify(frames).flatten(2).transpose(1, 2)
-        cls = self.cls_token.expand(patches.size(0), -1, -1)
-        tokens = torch.cat([cls, patches], dim=1) + self.pos
+        tokens = torch.cat([self.cls_token.expand(patches.size(0), -1, -1), patches], dim=1) + self.pos
         return self.projector(self.blocks(tokens))
 
 class Predictor(nn.Module):
     def __init__(self, config: "WorldModelConfig"):
         super().__init__()
         self.action_proj = nn.Linear(config.action_dim, config.dim)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, 1, config.dim) * 0.02)
         self.time_pos = nn.Parameter(torch.randn(1, config.max_seq_len, 1, config.dim) * 0.02)
-        self.kind_pos = nn.Parameter(torch.randn(1, 1, 2, config.dim) * 0.02)
         self.blocks = TransformerStack(config.dim, config.n_heads, config.n_blocks, config.ffn_mult, config.dropout_proba, causal=config.causal)
         self.projector = Projector(config.dim)
 
     def forward(self, tokens: Tensor, actions: Tensor) -> Tensor:
-        if tokens.dim() == 3:
-            tokens = tokens.unsqueeze(1)
-        if actions.dim() == 2:
-            actions = actions.unsqueeze(1)
-
+        if tokens.dim() == 3: tokens = tokens.unsqueeze(1)
+        if actions.dim() == 2: actions = actions.unsqueeze(1)
         b, t, n, d = tokens.shape
-        if t > self.time_pos.size(1):
-            raise ValueError(f"Sequence length {t} > max_seq_len={self.time_pos.size(1)}")
+        if t > self.time_pos.size(1): raise ValueError(f"Sequence length {t} > max_seq_len={self.time_pos.size(1)}")
+        action = self.action_proj(actions.to(dtype=tokens.dtype)).unsqueeze(2)
+        x = tokens + action + self.time_pos[:, :t]
+        x = x.reshape(b, t * n, d)
+        x = self.projector(self.blocks(x))
+        return x.view(b, t, n, d)
 
-        actions = actions.to(dtype=tokens.dtype)
-        action = self.action_proj(actions).unsqueeze(2)
-        image_tokens = tokens + action + self.time_pos[:, :t] + self.kind_pos[:, :, 1:2]
-        cls = self.cls_token.expand(b, t, 1, d) + self.time_pos[:, :t] + self.kind_pos[:, :, 0:1]
-        seq = torch.cat([cls, image_tokens], dim=2).reshape(b, t * (n + 1), d)
-        seq = self.projector(self.blocks(seq)).view(b, t, n + 1, d)
-        return seq[:, :, :n]
+class TokenTransition(nn.Module):
+    def __init__(self, dim: int, n_heads: int, n_blocks: int = 2, ffn_mult: int = 3, dropout: float = 0.0):
+        super().__init__()
+        self.blocks = TransformerStack(dim, n_heads, n_blocks, ffn_mult, dropout)
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        return self.blocks(tokens)
 
 class Decoder(nn.Module):
     def __init__(self, config: "WorldModelConfig"):
         super().__init__()
-        self.patch_size = config.patch_size
-        self.grid_h = config.height // config.patch_size
-        self.grid_w = config.width // config.patch_size
-        self.n_patches = self.grid_h * self.grid_w
-        patch_dim = config.patch_size * config.patch_size * 3
-        hidden = config.dim * config.decoder_hidden_mult
-
-        self.state_to_tokens = nn.Linear(config.dim, config.dim * self.n_patches)
+        p = config.patch_size
+        gh = config.height // p
+        gw = config.width // p
+        self.grid_h = gh
+        self.grid_w = gw
+        self.n_patches = gh * gw
         self.pos = nn.Parameter(torch.randn(1, self.n_patches + 1, config.dim) * 0.02)
-        self.blocks = TransformerStack(
-            config.dim,
-            config.n_heads,
-            max(1, config.decoder_n_blocks),
-            config.ffn_mult,
-            config.dropout_proba,
-            causal=False,
-        )
-        self.to_patch = nn.Sequential(
-            nn.LayerNorm(config.dim),
-            nn.Linear(config.dim, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, patch_dim),
+        self.blocks = TransformerStack(config.dim, config.n_heads, max(1, config.decoder_n_blocks), config.ffn_mult, config.dropout_proba)
+        up_c = getattr(config, "decoder_up_width", 64)
+        self.to_grid = nn.Conv2d(config.dim, up_c, 1)
+        self.up = nn.Sequential(
+            nn.Conv2d(up_c, up_c * 4, 3, padding=1), nn.PixelShuffle(2), nn.SiLU(),
+            nn.Conv2d(up_c, up_c * 4, 3, padding=1), nn.PixelShuffle(2), nn.SiLU(),
+            nn.Conv2d(up_c, 3 * 25, 3, padding=1), nn.PixelShuffle(5),
         )
 
     def forward(self, tokens: Tensor) -> Tensor:
-        if tokens.dim() == 2:
-            tokens = self.state_to_tokens(tokens).view(tokens.size(0), self.n_patches, -1)
-        if tokens.dim() == 4:
-            b, t, n, d = tokens.shape
-            tokens = tokens.reshape(b * t, n, d)
-        if tokens.size(1) == self.n_patches:
-            cls = tokens.mean(dim=1, keepdim=True)
-            tokens = torch.cat([cls, tokens], dim=1)
-        if tokens.size(1) != self.n_patches + 1:
-            raise ValueError(f"Decoder expected {self.n_patches} patch tokens (+ optional CLS), got {tokens.size(1)}")
-
-        tokens = tokens + self.pos.to(dtype=tokens.dtype)
-        tokens = self.blocks(tokens)[:, 1:]
-        patches = self.to_patch(tokens)
-        p = self.patch_size
-        img = patches.view(tokens.size(0), self.grid_h, self.grid_w, 3, p, p)
-        img = img.permute(0, 3, 1, 4, 2, 5).contiguous()
-        return torch.sigmoid(img.view(tokens.size(0), 3, self.grid_h * p, self.grid_w * p))
+        if tokens.size(-2) != self.n_patches + 1:
+            raise ValueError(f"Decoder needs CLS + {self.n_patches} patches, got {tokens.size(-2)} tokens")
+        x = self.blocks(tokens + self.pos.to(dtype=tokens.dtype))[:, 1:]
+        d = x.size(-1)
+        x = x.permute(0, 2, 1).reshape(-1, d, self.grid_h, self.grid_w)
+        return torch.sigmoid(self.up(self.to_grid(x)))
 
 class WorldModelConfig(PretrainedConfig):
     model_type = "world_model"
 
     def __init__(
         self,
-        height: int = 240,
-        width: int = 320,
-        patch_size: int = 16,
-        dim: int = 256,
-        n_heads: int = 4,
-        n_blocks: int = 3,
-        decoder_hidden_mult: int = 4,
-        decoder_n_blocks: int = 4,
-        decoder_noise_std: float = 0.05,
-        decoder_pred_token_ratio: float = 0.5,
-        decoder_curriculum_end: float = 0.8,
-        ffn_mult: int = 3,
-        dropout_proba: float = 0.1,
-        causal: bool = True,
-        action_dim: int = 9,
-        max_seq_len: int = 64,
+        height: int = 240, width: int = 320, patch_size: int = 16, dim: int = 256, n_heads: int = 4,
+        n_blocks: int = 3, decoder_hidden_mult: int = 4, decoder_n_blocks: int = 4,
+        decoder_noise_std: float = 0.05, decoder_pred_token_ratio: float = 0.98,
+        decoder_curriculum_end: float = 0.85, transition_n_blocks: int = 2, ffn_mult: int = 3,
+        dropout_proba: float = 0.1, causal: bool = True, action_dim: int = 9, max_seq_len: int = 64,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -221,6 +163,7 @@ class WorldModelConfig(PretrainedConfig):
         self.decoder_noise_std = decoder_noise_std
         self.decoder_pred_token_ratio = decoder_pred_token_ratio
         self.decoder_curriculum_end = decoder_curriculum_end
+        self.transition_n_blocks = transition_n_blocks
         self.ffn_mult = ffn_mult
         self.dropout_proba = dropout_proba
         self.causal = causal
@@ -233,20 +176,17 @@ class WorldModel(PreTrainedModel):
 
     def __init__(self, config: WorldModelConfig):
         super().__init__(config)
-        assert config.height % config.patch_size == 0
-        assert config.width % config.patch_size == 0
         self.n_patches = (config.height // config.patch_size) * (config.width // config.patch_size)
         self.encoder = ViTEncoder(config)
         self.predictor = Predictor(config)
+        self.transition = TokenTransition(config.dim, config.n_heads, config.transition_n_blocks, config.ffn_mult, config.dropout_proba)
         self.decoder = Decoder(config)
 
     def encode(self, frames: Tensor, return_tokens: bool = False):
-        if frames.dim() == 4:
-            frames = frames.unsqueeze(1)
+        if frames.dim() == 4: frames = frames.unsqueeze(1)
         b, t, c, h, w = frames.shape
         frames = frames.reshape(b * t, c, h, w)
-        if frames.is_cuda:
-            frames = frames.contiguous(memory_format=torch.channels_last)
+        if frames.is_cuda: frames = frames.contiguous(memory_format=torch.channels_last)
         tokens = self.encoder(frames).view(b, t, self.n_patches + 1, self.config.dim)
         states = tokens[:, :, 0]
         return (states, tokens) if return_tokens else states
@@ -255,9 +195,7 @@ class WorldModel(PreTrainedModel):
         return self.predictor(states, actions)
 
     def forward(self, frames: Tensor, actions: Tensor, decode: bool = False):
-        if not decode:
-            _, tokens = self.encode(frames, return_tokens=True)
-            return self.predict(tokens, actions)
         _, tokens = self.encode(frames, return_tokens=True)
+        if not decode: return self.predict(tokens, actions)
         pred_tokens = self.predict(tokens, actions)
-        return pred_tokens[:, :, 0], self.decoder(pred_tokens)
+        return pred_tokens[:, :, 0], self.decoder(self.transition(pred_tokens[:, -1]))

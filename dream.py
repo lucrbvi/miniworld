@@ -18,15 +18,7 @@ KEY = rl.KeyboardKey
 MOUSE = rl.MouseButton
 
 ACTION_NAMES = [
-    "FWD",
-    "BCK",
-    "LEFT",
-    "RIGHT",
-    "TURN_L",
-    "TURN_R",
-    "ATTACK",
-    "USE",
-    "SPEED",
+    "FWD", "BCK", "LEFT", "RIGHT", "TURN_L", "TURN_R", "ATTACK", "USE", "SPEED",
 ]
 
 def config_for_checkpoint(model_path: str, state_dict: dict[str, torch.Tensor]) -> WorldModelConfig:
@@ -90,9 +82,10 @@ def load_state_dict_checked(model: WorldModel, state_dict: dict[str, torch.Tenso
             raise
         filtered = {k: v for k, v in state_dict.items() if not k.startswith("decoder.")}
         result = model.load_state_dict(filtered, strict=False)
-        optional_prefixes = ("decoder.",)
+        optional_prefixes = ("decoder.", "transition.")
+        old_keys = {"predictor.cls_token", "predictor.kind_pos"}
         bad_missing = [k for k in result.missing_keys if not k.startswith(optional_prefixes)]
-        bad_unexpected = [k for k in result.unexpected_keys if not k.startswith(optional_prefixes)]
+        bad_unexpected = [k for k in result.unexpected_keys if not k.startswith(optional_prefixes) and k not in old_keys]
         if bad_missing or bad_unexpected:
             sample_keys = ", ".join(list(state_dict.keys())[:8])
             raise RuntimeError(
@@ -152,7 +145,6 @@ def tensor_to_frame(tensor: torch.Tensor) -> np.ndarray:
 
 def build_action() -> list[float]:
     action = [0.0] * len(ACTION_NAMES)
-
     if rl.is_key_down(KEY.KEY_W) or rl.is_key_down(KEY.KEY_UP):
         action[0] = 1.0
     if rl.is_key_down(KEY.KEY_S) or rl.is_key_down(KEY.KEY_DOWN):
@@ -171,7 +163,6 @@ def build_action() -> list[float]:
         action[7] = 1.0
     if rl.is_key_down(KEY.KEY_LEFT_SHIFT) or rl.is_key_down(KEY.KEY_RIGHT_SHIFT):
         action[8] = 1.0
-
     return action
 
 def make_texture(frame: np.ndarray) -> rl.Texture:
@@ -208,7 +199,7 @@ def predict_next_frame(
     amp: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, list[list[float]] | torch.Tensor]:
     if isinstance(actions, list):
-        actions = actions[-token_history.size(1) :]
+        actions = actions[-token_history.size(1):]
         action_tensor = torch.tensor(actions, device=device, dtype=token_history.dtype).unsqueeze(0)
     else:
         action_tensor = actions
@@ -216,14 +207,14 @@ def predict_next_frame(
         predicted_tokens = model.predict(token_history, action_tensor)[:, -1]
         if predicted_tokens.size(1) != model.n_patches + 1:
             raise ValueError("Predictor must return CLS + all patch tokens for decoding")
-        pixel_pred = model.decoder(predicted_tokens)[0]
+        pixel_pred = model.decoder(model.transition(predicted_tokens))[0]
 
     next_tok = predicted_tokens.unsqueeze(1)
     if token_history.size(1) < max_context_len:
         token_history = torch.cat([token_history, next_tok], dim=1)
     else:
         token_history = torch.cat([token_history[:, 1:], next_tok], dim=1)
-        actions = actions[-max_context_len + 1 :]
+        actions = actions[-max_context_len + 1:]
     return pixel_pred, token_history, actions
 
 def draw_ui(action: list[float], fps: float, generated_count: int) -> None:
@@ -263,16 +254,10 @@ def run(args: argparse.Namespace) -> None:
         while not rl.window_should_close():
             action = build_action()
             now = rl.get_time()
-
             if now - last_step_time >= frame_interval:
                 actions.append(action)
                 next_frame, token_history, actions = predict_next_frame(
-                    model,
-                    token_history,
-                    actions,
-                    args.context_len,
-                    device,
-                    args.amp,
+                    model, token_history, actions, args.context_len, device, args.amp,
                 )
                 frame_tensor = next_frame.to(dtype=next(model.parameters()).dtype)
                 frame = tensor_to_frame(next_frame)
@@ -302,7 +287,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fp32", action="store_true", help="Use float32 precision instead of float16")
     parser.set_defaults(amp=True)
     args = parser.parse_args()
-
     if args.context_len < 1:
         raise ValueError("--context-len must be >= 1")
     if args.fps <= 0:

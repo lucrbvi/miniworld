@@ -91,7 +91,13 @@ class Predictor(nn.Module):
         if tokens.dim() == 3: tokens = tokens.unsqueeze(1)
         if actions.dim() == 2: actions = actions.unsqueeze(1)
         b, t, n, d = tokens.shape
-        if t > self.time_pos.size(1): raise ValueError(f"Sequence length {t} > max_seq_len={self.time_pos.size(1)}")
+        cap = self.time_pos.size(1)
+        if t > cap:
+            raise ValueError(
+                f"Sequence length {t} exceeds model capacity ({cap}). "
+                f"This means the training loop built a context longer than the Predictor's time_pos size. "
+                f"Check that the data's context_len and the model's max_seq_len are consistent."
+            )
         action = self.action_proj(actions.to(dtype=tokens.dtype)).unsqueeze(2)
         x = tokens + action + self.time_pos[:, :t]
         x = x.reshape(b, t * n, d)
@@ -175,6 +181,18 @@ class WorldModel(PreTrainedModel):
         self.predictor = Predictor(config)
         self.transition = TokenTransition(config.dim, config.n_heads, config.transition_n_blocks, config.ffn_mult, config.dropout_proba)
         self.decoder = Decoder(config)
+        self._sync_max_seq_len()
+
+    def _sync_max_seq_len(self) -> None:
+        actual = self.predictor.time_pos.size(1)
+        if self.config.max_seq_len != actual:
+            self.config.max_seq_len = actual
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        model = super().from_pretrained(*args, **kwargs)
+        model._sync_max_seq_len()
+        return model
 
     def encode(self, frames: Tensor, return_tokens: bool = False):
         if frames.dim() == 4: frames = frames.unsqueeze(1)

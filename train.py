@@ -142,7 +142,7 @@ class DecoderTrainer(SectionedWandbTrainer):
                 progress = min(1.0, self.state.global_step / end_step)
             pred_ratio = model.config.decoder_pred_token_ratio * progress
 
-            steps = min(t - 1, model.config.max_seq_len - 1)
+            steps = min(t - 1, model.predictor.time_pos.size(1) - 1)
             latents = torch.empty(b, steps, n_p1, d, dtype=tokens.dtype, device=tokens.device)
             context = tokens[:, :1].contiguous()
             for s in range(steps):
@@ -214,9 +214,12 @@ class WMTrainer(SectionedWandbTrainer):
 
         observations = torch.cat([frames, target_frame], dim=1)
         embeddings, tokens = model.encode(observations, return_tokens=True)
-        pred_tokens = model.predict(tokens[:, :-1], actions)
 
-        rollout_len = min(self.rollout_steps, actions.size(1))
+        max_pred_len = min(tokens.size(1) - 1, model.predictor.time_pos.size(1))
+        pred_tokens = model.predict(tokens[:, :max_pred_len], actions[:, :max_pred_len])
+        target_tokens = tokens[:, 1:1 + max_pred_len]
+
+        rollout_len = min(self.rollout_steps, actions.size(1), model.predictor.time_pos.size(1) - 1)
         rollout_preds = []
         rollout_tokens = tokens[:, :1]
         for t in range(rollout_len):
@@ -225,7 +228,6 @@ class WMTrainer(SectionedWandbTrainer):
             rollout_tokens = torch.cat([rollout_tokens, next_preds.unsqueeze(1)], dim=1)
         rollout_preds = torch.stack(rollout_preds, dim=1)
 
-        target_tokens = tokens[:, 1:]
         sigreg_loss = torch.stack([
             self.sigreg(tokens[:, t].reshape(-1, tokens.size(-1)).float()) for t in range(tokens.size(1))
         ]).mean()

@@ -249,7 +249,9 @@ class WMTrainer(SectionedWandbTrainer):
         tgt_n = F.normalize(target_tokens.float(), dim=-1)
         pred_loss = 1.0 - (pred_n * tgt_n).sum(-1).mean()
 
-        rollout_loss = F.mse_loss(rollout_preds.float(), tokens[:, 1 : 1 + rollout_len].float())
+        rl_n = F.normalize(rollout_preds.float(), dim=-1)
+        rl_tgt_n = F.normalize(tokens[:, 1 : 1 + rollout_len].float(), dim=-1)
+        rollout_loss = (1.0 - (rl_n * rl_tgt_n).sum(-1)).mean()
         loss = pred_loss + self.rollout_weight * rollout_loss + self.sigreg_weight * (sigreg_loss + sigreg_pred_loss)
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:

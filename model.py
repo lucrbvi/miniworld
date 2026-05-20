@@ -51,17 +51,24 @@ class TransformerStack(nn.Module):
         return self.norm(x)
 
 class ActionPolicy(nn.Module):
-    def __init__(self, dim: int, action_dim: int = 9, hidden_dim: int = 256):
+    def __init__(self, dim: int, action_dim: int = 9, n_heads: int = 4, n_blocks: int = 2, ffn_mult: int = 3, dropout: float = 0.1, max_seq_len: int = 64):
         super().__init__()
-        self.net = nn.Sequential(
+        self.max_seq_len = max_seq_len
+        self.time_pos = nn.Parameter(torch.randn(1, max_seq_len, dim) * 0.02)
+        self.blocks = TransformerStack(dim, n_heads, n_blocks, ffn_mult, dropout, causal=True)
+        self.head = nn.Sequential(
             nn.LayerNorm(dim),
-            nn.Linear(dim, hidden_dim), nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
-            nn.Linear(hidden_dim, action_dim),
+            nn.Linear(dim, dim), nn.SiLU(),
+            nn.Linear(dim, action_dim),
         )
 
-    def forward(self, latent: Tensor) -> Tensor:
-        return self.net(latent)
+    def forward(self, states: Tensor) -> Tensor:
+        if states.dim() == 2:
+            states = states.unsqueeze(1)
+        t = states.size(1)
+        if t > self.time_pos.size(1):
+            raise ValueError(f"ActionPolicy got sequence length {t} > max_seq_len {self.time_pos.size(1)}")
+        return self.head(self.blocks(states + self.time_pos[:, :t]))
 
 class ViTEncoder(nn.Module):
     def __init__(self, config: "WorldModelConfig"):
@@ -79,13 +86,37 @@ class ViTEncoder(nn.Module):
         tokens = torch.cat([self.cls_token.expand(patches.size(0), -1, -1), patches], dim=1) + self.pos
         return self.projector(self.blocks(tokens))
 
+class AdaLNBlock(nn.Module):
+    def __init__(self, dim: int, n_heads: int, ffn_mult: int, dropout: float):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.attn = nn.MultiheadAttention(dim, n_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.mlp = MLP(dim, dim * ffn_mult, dim, dropout)
+        self.mod = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+        nn.init.zeros_(self.mod[-1].weight)
+        nn.init.zeros_(self.mod[-1].bias)
+
+    def forward(self, x: Tensor, cond: Tensor, attn_mask: Tensor | None = None) -> Tensor:
+        scale_a, shift_a, gate_a, scale_m, shift_m, gate_m = self.mod(cond).chunk(6, dim=-1)
+        h = self.norm1(x) * (1 + scale_a) + shift_a
+        x = x + gate_a * self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)[0]
+        h = self.norm2(x) * (1 + scale_m) + shift_m
+        x = x + gate_m * self.mlp(h)
+        return x
+
 class Predictor(nn.Module):
     def __init__(self, config: "WorldModelConfig"):
         super().__init__()
         self.action_proj = nn.Linear(config.action_dim, config.dim)
         self.time_pos = nn.Parameter(torch.randn(1, config.max_seq_len, 1, config.dim) * 0.02)
-        self.blocks = TransformerStack(config.dim, config.n_heads, config.n_blocks, config.ffn_mult, config.dropout_proba, causal=config.causal)
+        self.blocks = nn.ModuleList([
+            AdaLNBlock(config.dim, config.n_heads, config.ffn_mult, config.dropout_proba)
+            for _ in range(config.n_blocks)
+        ])
+        self.norm = nn.LayerNorm(config.dim)
         self.projector = Projector(config.dim)
+        self.causal = config.causal
 
     def forward(self, tokens: Tensor, actions: Tensor) -> Tensor:
         if tokens.dim() == 3: tokens = tokens.unsqueeze(1)
@@ -98,11 +129,18 @@ class Predictor(nn.Module):
                 f"This means the training loop built a context longer than the Predictor's time_pos size. "
                 f"Check that the data's context_len and the model's max_seq_len are consistent."
             )
-        action = self.action_proj(actions.to(dtype=tokens.dtype)).unsqueeze(2)
-        x = tokens + action + self.time_pos[:, :t]
-        x = x.reshape(b, t * n, d)
-        x = self.projector(self.blocks(x))
-        return x.view(b, t, n, d)
+        action_emb = self.action_proj(actions.to(dtype=tokens.dtype))
+        cond = action_emb.unsqueeze(2).expand(-1, -1, n, -1).reshape(b, t * n, d)
+        x = (tokens + self.time_pos[:, :t]).reshape(b, t * n, d)
+        attn_mask = self._block_causal_mask(t, n, x.device, x.dtype) if self.causal else None
+        for block in self.blocks:
+            x = block(x, cond, attn_mask=attn_mask)
+        return self.projector(self.norm(x)).view(b, t, n, d)
+
+    @staticmethod
+    def _block_causal_mask(t: int, n: int, device, dtype) -> Tensor:
+        frame_idx = torch.arange(t * n, device=device) // n
+        return torch.where(frame_idx[None, :] > frame_idx[:, None], float("-inf"), 0.0).to(dtype=dtype)
 
 class TokenTransition(nn.Module):
     def __init__(self, dim: int, n_heads: int, n_blocks: int = 2, ffn_mult: int = 3, dropout: float = 0.0):

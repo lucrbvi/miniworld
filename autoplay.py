@@ -20,7 +20,6 @@ BUTTONS = [
 ]
 
 def load_action_policy(path: str, config, device: str) -> ActionPolicy:
-    ap = ActionPolicy(config.dim)
     if os.path.isdir(path):
         candidates = ["model.safetensors", "pytorch_model.bin"]
         ap_path = next((os.path.join(path, name) for name in candidates if os.path.isfile(os.path.join(path, name))), None)
@@ -31,6 +30,9 @@ def load_action_policy(path: str, config, device: str) -> ActionPolicy:
     else:
         raise FileNotFoundError(f"ActionPolicy not found: {path!r}")
     sd = load_file(ap_path, device="cpu") if ap_path.endswith(".safetensors") else torch.load(ap_path, map_location="cpu")
+    sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+    max_seq_len = sd["time_pos"].shape[1] if "time_pos" in sd else 64
+    ap = ActionPolicy(config.dim, n_heads=config.n_heads, ffn_mult=config.ffn_mult, max_seq_len=max_seq_len)
     ap.load_state_dict(sd)
     ap.to(device=device).eval()
     for p in ap.parameters():
@@ -40,7 +42,7 @@ def load_action_policy(path: str, config, device: str) -> ActionPolicy:
 @torch.inference_mode()
 def encode_frame(model: WorldModel, frame: np.ndarray, device: str, dtype: torch.dtype) -> torch.Tensor:
     x = torch.from_numpy(np.transpose(frame, (2, 0, 1)).copy()).to(device=device, dtype=dtype) / 255.0
-    return model.encode(x[None, None])[:, 0]
+    return model.encode(x[None, None])[:, 0]  # [1, D]
 
 def run(args: argparse.Namespace) -> None:
     load_dotenv()
@@ -77,6 +79,8 @@ def run(args: argparse.Namespace) -> None:
     game.init()
 
     video = None
+    history: torch.Tensor | None = None
+    max_ctx = ap.max_seq_len
     try:
         game.new_episode()
         step = 0
@@ -90,8 +94,11 @@ def run(args: argparse.Namespace) -> None:
             else:
                 frame = raw
 
-            cls_token = encode_frame(model, frame, device, dtype)
-            logits = ap(cls_token)
+            cls_token = encode_frame(model, frame, device, dtype)  # [1, D]
+            new_step = cls_token.unsqueeze(1)  # [1, 1, D]
+            history = new_step if history is None else torch.cat([history, new_step], dim=1)[:, -max_ctx:]
+
+            logits = ap(history)[:, -1]  # last position is next-action prediction
             action = (torch.sigmoid(logits) > args.threshold).int()[0].cpu().tolist()
 
             active = [name for name, val in zip(ACTION_NAMES, action) if val]

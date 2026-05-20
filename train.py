@@ -188,10 +188,11 @@ class DecoderTrainer(SectionedWandbTrainer):
 class WMTrainer(SectionedWandbTrainer):
     wandb_section = "wm"
 
-    def __init__(self, *args, sigreg_weight: float = 0.1, rollout_steps: int = 2, **kwargs):
+    def __init__(self, *args, sigreg_weight: float = 0.1, rollout_steps: int = 6, rollout_weight: float = 2.0, **kwargs):
         super().__init__(*args, **kwargs)
         self.sigreg_weight = sigreg_weight
         self.rollout_steps = rollout_steps
+        self.rollout_weight = rollout_weight
         self.sigreg = lejepa.multivariate.SlicingUnivariateTest(
             univariate_test=lejepa.univariate.EppsPulley(n_points=17), num_slices=1024,
         )
@@ -234,7 +235,7 @@ class WMTrainer(SectionedWandbTrainer):
         ]).mean()
         pred_loss = F.mse_loss(pred_tokens.float(), target_tokens.float())
         rollout_loss = F.mse_loss(rollout_preds.float(), tokens[:, 1 : 1 + rollout_len].float())
-        loss = pred_loss + rollout_loss + self.sigreg_weight * sigreg_loss
+        loss = pred_loss + self.rollout_weight * rollout_loss + self.sigreg_weight * sigreg_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
             flat_z = tokens.flatten(0, 2)
@@ -272,14 +273,26 @@ def resolve_checkpoint(resume_from: str | None, output_dir: str) -> str | None:
         raise FileNotFoundError(f"Checkpoint not found: {resume_from}")
     return resume_from
 
+ACTION_NAMES = ["FWD", "BCK", "LEFT", "RIGHT", "TURN_L", "TURN_R", "ATTACK", "USE", "SPEED"]
+
+def compute_action_pos_weight(hf_dataset: HFDataset, n_buttons: int = 9) -> torch.Tensor:
+    actions = np.asarray(hf_dataset.select_columns("action").with_format("numpy")[:]["action"], dtype=np.float32)
+    flat = actions.reshape(-1, n_buttons)
+    n_pos = flat.sum(axis=0).clip(min=1)
+    n_neg = (len(flat) - flat.sum(axis=0)).clip(min=1)
+    weights = n_neg / n_pos
+    print(f"pos_weight: {dict(zip(ACTION_NAMES, np.round(weights, 2).tolist()))}", flush=True)
+    return torch.from_numpy(weights.astype(np.float32))
+
 class ActionPolicyTrainer(SectionedWandbTrainer):
     wandb_section = "action_policy"
 
-    def __init__(self, wm_model: WorldModel, *args, **kwargs):
+    def __init__(self, wm_model: WorldModel, *args, pos_weight: torch.Tensor | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.wm_model = wm_model.eval()
         for p in self.wm_model.parameters():
             p.requires_grad = False
+        self.pos_weight = pos_weight
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
@@ -296,12 +309,20 @@ class ActionPolicyTrainer(SectionedWandbTrainer):
             states = self.wm_model.encode(frames)
 
         logits = model(states)
-        loss = F.binary_cross_entropy_with_logits(logits, actions)
+        pos_weight = self.pos_weight.to(device=logits.device, dtype=logits.dtype) if self.pos_weight is not None else None
+        loss = F.binary_cross_entropy_with_logits(logits, actions, pos_weight=pos_weight)
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
             with torch.no_grad():
-                acc = ((logits > 0).float() == actions).float().mean()
-            self.log({"loss": scalar(loss), "acc": scalar(acc)})
+                preds = (torch.sigmoid(logits) > 0.5).float()
+                acc = (preds == actions).float().mean()
+                pos_rate = preds.mean()
+                target_rate = actions.mean()
+                tp = (preds * actions).sum().clamp_min(1)
+                fp = (preds * (1 - actions)).sum()
+                fn = ((1 - preds) * actions).sum()
+                f1 = (2 * tp / (2 * tp + fp + fn)).item()
+            self.log({"loss": scalar(loss), "acc": scalar(acc), "f1": f1, "pred_pos_rate": scalar(pos_rate), "target_pos_rate": scalar(target_rate)})
 
         if return_outputs:
             return loss, {"logits": logits.detach()}
@@ -448,12 +469,24 @@ def train(
             optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
             torch_compile=True,
         )
+        policy = ActionPolicy(
+            dim=model.config.dim,
+            n_heads=model.config.n_heads,
+            ffn_mult=model.config.ffn_mult,
+            max_seq_len=max(context_len, model.config.max_seq_len),
+        )
+        policy_params = sum(p.numel() for p in policy.parameters())
+        print(f"ActionPolicy: {policy_params:,} params", flush=True)
+        pos_weight = compute_action_pos_weight(split["train"])
         ap_trainer = ActionPolicyTrainer(
-            wm_model=model, model=ActionPolicy(model.config.dim), args=ap_args,
+            wm_model=model, model=policy, args=ap_args,
             train_dataset=train_dataset, eval_dataset=eval_dataset,
+            pos_weight=pos_weight,
         )
         start_wandb_run("action-policy", config=config.to_dict())
         ap_trainer.train()
+        if hasattr(ap_trainer.model, "_orig_mod"):
+            ap_trainer.model = ap_trainer.model._orig_mod
         ap_trainer.save_model(ap_args.output_dir)
         finish_wandb()
         return
@@ -499,6 +532,10 @@ def train(
     trainer = DecoderTrainer(model=model, args=decoder_args, train_dataset=train_dataset, eval_dataset=eval_dataset)
     start_wandb_run("decoder-probe", config=config.to_dict())
     trainer.train(resume_from_checkpoint=decoder_checkpoint)
+    if hasattr(trainer.model.decoder, "_orig_mod"):
+        trainer.model.decoder = trainer.model.decoder._orig_mod
+    if hasattr(trainer.model.transition, "_orig_mod"):
+        trainer.model.transition = trainer.model.transition._orig_mod
     trainer.model.to(torch.bfloat16)
     trainer.save_model(decoder_args.output_dir)
     finish_wandb()

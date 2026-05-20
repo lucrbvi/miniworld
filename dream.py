@@ -75,6 +75,7 @@ def get_device() -> str:
     return "cpu"
 
 def load_state_dict_checked(model: WorldModel, state_dict: dict[str, torch.Tensor], source: str) -> None:
+    state_dict = {k.replace("._orig_mod.", "."): v for k, v in state_dict.items()}
     try:
         model.load_state_dict(state_dict)
     except RuntimeError as exc:

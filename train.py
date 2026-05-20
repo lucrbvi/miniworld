@@ -167,8 +167,9 @@ class DecoderTrainer(SectionedWandbTrainer):
             if model.config.decoder_noise_std > 0:
                 latents = latents + torch.randn_like(latents) * model.config.decoder_noise_std
 
-        recon = model.decoder(latents)
+        recon = model.decoder(latents.reshape(-1, n_p1, d))
         targets = targets.reshape(-1, *observations.shape[2:])
+        assert recon.shape == targets.shape, f"recon {recon.shape} vs targets {targets.shape}"
         l1_loss = F.l1_loss(recon.float(), targets.float())
         lpips_loss = self.lpips_loss(recon.float() * 2 - 1, targets.float() * 2 - 1).mean()
         loss = l1_loss + self.lpips_weight * lpips_loss

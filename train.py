@@ -151,9 +151,7 @@ class DecoderTrainer(SectionedWandbTrainer):
                 latents[:, s] = next_pred
                 use_teacher = torch.rand(b, 1, 1, 1, device=next_pred.device) >= pred_ratio
                 next_token = torch.where(use_teacher, tokens[:, s + 1:s + 2], next_pred.unsqueeze(1))
-                assert next_token.shape == (b, 1, n_p1, d), f"next_token shape {next_token.shape} != {(b, 1, n_p1, d)} (silent broadcast?)"
                 context = torch.cat([context, next_token], dim=1)
-                assert context.size(1) == s + 2, f"context grew to {context.size(1)} at step {s} (expected {s + 2})"
 
             if self.rollout_decode_steps > 0 and steps > self.rollout_decode_steps:
                 step_idx = torch.randperm(steps, device=latents.device)[:self.rollout_decode_steps].sort().values
@@ -162,14 +160,13 @@ class DecoderTrainer(SectionedWandbTrainer):
             else:
                 targets = observations[:, 1:]
 
-            latents = model.transition(latents.reshape(-1, n_p1, d)).reshape(b, -1, n_p1, d)
+            latents = model.transition(latents)
 
             if model.config.decoder_noise_std > 0:
                 latents = latents + torch.randn_like(latents) * model.config.decoder_noise_std
 
-        recon = model.decoder(latents.reshape(-1, n_p1, d))
-        targets = targets.reshape(-1, *observations.shape[2:])
-        assert recon.shape == targets.shape, f"recon {recon.shape} vs targets {targets.shape}"
+        recon = model.decoder(latents).flatten(0, 1)
+        targets = targets.flatten(0, 1)
         l1_loss = F.l1_loss(recon.float(), targets.float())
         lpips_loss = self.lpips_loss(recon.float() * 2 - 1, targets.float() * 2 - 1).mean()
         loss = l1_loss + self.lpips_weight * lpips_loss

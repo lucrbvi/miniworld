@@ -110,7 +110,10 @@ class TokenTransition(nn.Module):
         self.blocks = TransformerStack(dim, n_heads, n_blocks, ffn_mult, dropout)
 
     def forward(self, tokens: Tensor) -> Tensor:
-        return self.blocks(tokens)
+        lead = tokens.shape[:-2]
+        n, d = tokens.shape[-2:]
+        out = self.blocks(tokens.reshape(-1, n, d))
+        return out.reshape(*lead, n, d)
 
 class Decoder(nn.Module):
     def __init__(self, config: "WorldModelConfig"):
@@ -134,10 +137,13 @@ class Decoder(nn.Module):
     def forward(self, tokens: Tensor) -> Tensor:
         if tokens.size(-2) != self.n_patches + 1:
             raise ValueError(f"Decoder needs CLS + {self.n_patches} patches, got {tokens.size(-2)} tokens")
+        lead = tokens.shape[:-2]
+        n, d = tokens.shape[-2:]
+        tokens = tokens.reshape(-1, n, d)
         x = self.blocks(tokens + self.pos.to(dtype=tokens.dtype))[:, 1:]
-        d = x.size(-1)
         x = x.permute(0, 2, 1).reshape(-1, d, self.grid_h, self.grid_w)
-        return torch.sigmoid(self.up(self.to_grid(x)))
+        out = torch.sigmoid(self.up(self.to_grid(x)))
+        return out.reshape(*lead, *out.shape[1:])
 
 class WorldModelConfig(PretrainedConfig):
     model_type = "world_model"

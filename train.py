@@ -149,8 +149,11 @@ class DecoderTrainer(SectionedWandbTrainer):
                 pred = model.predict(context, actions[:, :s + 1])
                 next_pred = pred[:, -1]
                 latents[:, s] = next_pred
-                use_teacher = torch.rand(b, 1, 1, device=next_pred.device) >= pred_ratio
-                context = torch.cat([context, torch.where(use_teacher, tokens[:, s + 1:s + 2], next_pred.unsqueeze(1))], dim=1)
+                use_teacher = torch.rand(b, 1, 1, 1, device=next_pred.device) >= pred_ratio
+                next_token = torch.where(use_teacher, tokens[:, s + 1:s + 2], next_pred.unsqueeze(1))
+                assert next_token.shape == (b, 1, n_p1, d), f"next_token shape {next_token.shape} != {(b, 1, n_p1, d)} (silent broadcast?)"
+                context = torch.cat([context, next_token], dim=1)
+                assert context.size(1) == s + 2, f"context grew to {context.size(1)} at step {s} (expected {s + 2})"
 
             if self.rollout_decode_steps > 0 and steps > self.rollout_decode_steps:
                 step_idx = torch.randperm(steps, device=latents.device)[:self.rollout_decode_steps].sort().values

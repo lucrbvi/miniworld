@@ -32,9 +32,10 @@ def find_last_checkpoint(path: str) -> str | None:
     return get_last_checkpoint(path) if os.path.isdir(path) else None
 
 class WMDataset(torch.utils.data.Dataset):
-    def __init__(self, hf_dataset: HFDataset, context_len: int, sequence_stride: int = 1, name: str = "dataset"):
+    def __init__(self, hf_dataset: HFDataset, context_len: int, sequence_stride: int = 1, frame_skip: int = 1, name: str = "dataset"):
         self.context_len = context_len
-        self.window_len = context_len + 1
+        self.frame_skip = frame_skip
+        self.window_len = context_len + frame_skip
         self.sequence_stride = sequence_stride
         episodes = self._episode_ids(hf_dataset)
         self.valid_indices = self._valid_window_starts(episodes)
@@ -50,8 +51,8 @@ class WMDataset(torch.utils.data.Dataset):
         actions = np.asarray(samples["action"])
         return {
             "frames": torch.from_numpy(frames[: self.context_len]),
-            "target_frame": torch.from_numpy(frames[self.context_len]),
-            "actions": torch.from_numpy(actions[: self.context_len]).float(),
+            "target_frame": torch.from_numpy(frames[self.context_len + self.frame_skip - 1]),
+            "actions": torch.from_numpy(actions[: self.context_len + self.frame_skip - 1]).float(),
         }
 
     def _valid_window_starts(self, episodes: np.ndarray) -> list[int]:
@@ -188,11 +189,12 @@ class DecoderTrainer(SectionedWandbTrainer):
 class WMTrainer(SectionedWandbTrainer):
     wandb_section = "wm"
 
-    def __init__(self, *args, sigreg_weight: float = 0.1, rollout_steps: int = 6, rollout_weight: float = 2.0, **kwargs):
+    def __init__(self, *args, sigreg_weight: float = 0.1, rollout_steps: int = 6, rollout_weight: float = 2.0, frame_skip: int = 1, **kwargs):
         super().__init__(*args, **kwargs)
         self.sigreg_weight = sigreg_weight
         self.rollout_steps = rollout_steps
         self.rollout_weight = rollout_weight
+        self.frame_skip = frame_skip
         self.sigreg = lejepa.multivariate.SlicingUnivariateTest(
             univariate_test=lejepa.univariate.EppsPulley(n_points=17), num_slices=1024,
         )
@@ -217,11 +219,19 @@ class WMTrainer(SectionedWandbTrainer):
         observations = torch.cat([frames, target_frame], dim=1)
         embeddings, tokens = model.encode(observations, return_tokens=True)
 
-        max_pred_len = min(tokens.size(1) - 1, model.predictor.time_pos.size(1))
-        pred_tokens = model.predict(tokens[:, :max_pred_len], actions[:, :max_pred_len])
-        target_tokens = tokens[:, 1:1 + max_pred_len]
+        context_len = frames.size(1)
+        context_tokens = tokens[:, :context_len]
+        target_tokens = tokens[:, context_len:context_len + 1]
 
-        rollout_len = min(self.rollout_steps, actions.size(1), model.predictor.time_pos.size(1) - 1)
+        # k-step rollout from last context frame using actions [t, t+k-1]
+        rollout = context_tokens
+        for step in range(self.frame_skip):
+            pred = model.predict(rollout, actions[:, :context_len + step])
+            next_token = pred[:, -1:]
+            rollout = torch.cat([rollout, next_token], dim=1)
+        pred_tokens = rollout[:, context_len + self.frame_skip - 1:context_len + self.frame_skip]
+
+        rollout_len = min(self.rollout_steps, context_len - 1, model.predictor.time_pos.size(1) - 1)
         rollout_preds = []
         rollout_tokens = tokens[:, :1]
         for t in range(rollout_len):
@@ -233,9 +243,14 @@ class WMTrainer(SectionedWandbTrainer):
         sigreg_loss = torch.stack([
             self.sigreg(tokens[:, t].reshape(-1, tokens.size(-1)).float()) for t in range(tokens.size(1))
         ]).mean()
-        pred_loss = F.mse_loss(pred_tokens.float(), target_tokens.float())
+        sigreg_pred_loss = self.sigreg(pred_tokens.reshape(-1, pred_tokens.size(-1)).float())
+
+        pred_n = F.normalize(pred_tokens.float(), dim=-1)
+        tgt_n = F.normalize(target_tokens.float(), dim=-1)
+        pred_loss = 1.0 - (pred_n * tgt_n).sum(-1).mean()
+
         rollout_loss = F.mse_loss(rollout_preds.float(), tokens[:, 1 : 1 + rollout_len].float())
-        loss = pred_loss + self.rollout_weight * rollout_loss + self.sigreg_weight * sigreg_loss
+        loss = pred_loss + self.rollout_weight * rollout_loss + self.sigreg_weight * (sigreg_loss + sigreg_pred_loss)
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
             flat_z = tokens.flatten(0, 2)
@@ -244,6 +259,7 @@ class WMTrainer(SectionedWandbTrainer):
                 "pred_loss": scalar(pred_loss),
                 "rollout_loss": scalar(rollout_loss),
                 "sigreg": scalar(sigreg_loss),
+                "sigreg_pred": scalar(sigreg_pred_loss),
                 "z_std_mean": scalar(flat_z.std(dim=0).mean()),
                 "z_std_min": scalar(flat_z.std(dim=0).min()),
                 "z_norm_mean": scalar(flat_z.norm(dim=-1).mean()),
@@ -251,6 +267,7 @@ class WMTrainer(SectionedWandbTrainer):
                 "pred_std": scalar(pred_tokens.flatten(0, 2).std(dim=0).mean()),
                 "target_std": scalar(target_tokens.flatten(0, 2).std(dim=0).mean()),
                 "pred_target_std_ratio": scalar(pred_tokens.flatten(0, 2).std(dim=0).mean() / target_tokens.flatten(0, 2).std(dim=0).mean().clamp_min(1e-6)),
+                "frame_skip": self.frame_skip,
             })
 
         if return_outputs:
@@ -304,6 +321,7 @@ class ActionPolicyTrainer(SectionedWandbTrainer):
         dtype = next(self.wm_model.parameters()).dtype
         frames = inputs["frames"].to(device=self.args.device, dtype=dtype) / 255.0
         actions = inputs["actions"].to(device=self.args.device, dtype=dtype)
+        actions = actions[:, :frames.size(1)]
 
         with torch.no_grad():
             states = self.wm_model.encode(frames)
@@ -336,6 +354,7 @@ def train(
     wm_checkpoint: str | None = None,
     context_len: int = 16,
     sequence_stride: int = 1,
+    frame_skip: int = 4,
     max_eval_sequences: int = 2048,
     dataloader_num_workers: int = 4,
     dataloader_prefetch_factor: int | None = 2,
@@ -352,10 +371,10 @@ def train(
     print(f"Device: {device} | Dataset: {config.to_dict()['height']}x{config.to_dict()['width']} | dim={config.dim} | blocks={config.n_blocks} | heads={config.n_heads}", flush=True)
     ds = load_dataset("lucrbrtv/doom-e1-internet-gameplay", split="train")
     split = ds.train_test_split(test_size=0.1, shuffle=False)
-    train_dataset = WMDataset(split["train"], context_len=context_len, sequence_stride=sequence_stride, name="train")
-    eval_dataset = WMDataset(split["test"], context_len=context_len, sequence_stride=sequence_stride, name="eval")
+    train_dataset = WMDataset(split["train"], context_len=context_len, sequence_stride=sequence_stride, frame_skip=frame_skip, name="train")
+    eval_dataset = WMDataset(split["test"], context_len=context_len, sequence_stride=sequence_stride, frame_skip=frame_skip, name="eval")
     eval_dataset = torch.utils.data.Subset(eval_dataset, range(min(max_eval_sequences, len(eval_dataset))))
-    print(f"Data: {len(ds):,} frames | {len(train_dataset):,} train seqs | {len(eval_dataset):,} eval seqs | context={context_len} | stride={sequence_stride}", flush=True)
+    print(f"Data: {len(ds):,} frames | {len(train_dataset):,} train seqs | {len(eval_dataset):,} eval seqs | context={context_len} | stride={sequence_stride} | frame_skip={frame_skip}", flush=True)
     setup_wandb()
     os.makedirs(output_root, exist_ok=True)
     model = WorldModel(config).to(torch.bfloat16)
@@ -420,7 +439,7 @@ def train(
 
     if mode in {"all", "wm"}:
         trainer = WMTrainer(
-            model=model, args=args, train_dataset=train_dataset, eval_dataset=eval_dataset, sigreg_weight=0.1,
+            model=model, args=args, train_dataset=train_dataset, eval_dataset=eval_dataset, sigreg_weight=0.1, frame_skip=frame_skip,
         )
         if last_checkpoint is not None:
             print(f"Resume: {last_checkpoint}", flush=True)
@@ -585,6 +604,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-eval-sequences", type=int, default=512)
     parser.add_argument("--dataloader-num-workers", type=int, default=4)
     parser.add_argument("--dataloader-prefetch-factor", type=int, default=2)
+    parser.add_argument("--frame-skip", type=int, default=4, help="Number of frames to skip ahead for world model prediction (k in t+k)")
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -596,6 +616,7 @@ if __name__ == "__main__":
         wm_checkpoint=cli.wm_checkpoint,
         context_len=cli.context_len,
         sequence_stride=cli.sequence_stride,
+        frame_skip=cli.frame_skip,
         max_eval_sequences=cli.max_eval_sequences,
         dataloader_num_workers=cli.dataloader_num_workers,
         dataloader_prefetch_factor=cli.dataloader_prefetch_factor,

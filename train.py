@@ -399,7 +399,7 @@ def train(
 
     if mode in {"all", "wm"}:
         trainer = WMTrainer(
-            model=model, args=args, train_dataset=train_dataset, eval_dataset=eval_dataset, sigreg_weight=0.05,
+            model=model, args=args, train_dataset=train_dataset, eval_dataset=eval_dataset, sigreg_weight=0.01,
         )
         if last_checkpoint is not None:
             print(f"Resume: {last_checkpoint}", flush=True)

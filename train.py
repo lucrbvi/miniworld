@@ -369,6 +369,7 @@ def train(
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     print(f"Device: {device} | Dataset: {config.to_dict()['height']}x{config.to_dict()['width']} | dim={config.dim} | blocks={config.n_blocks} | heads={config.n_heads}", flush=True)
     ds = load_dataset("lucrbrtv/doom-e1-internet-gameplay", split="train")
@@ -418,6 +419,8 @@ def train(
         run_name="world-model",
         optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
         torch_compile=True,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 
     steps_per_epoch = math.ceil(

@@ -32,10 +32,9 @@ def find_last_checkpoint(path: str) -> str | None:
     return get_last_checkpoint(path) if os.path.isdir(path) else None
 
 class WMDataset(torch.utils.data.Dataset):
-    def __init__(self, hf_dataset: HFDataset, context_len: int, sequence_stride: int = 1, frame_skip: int = 1, name: str = "dataset"):
+    def __init__(self, hf_dataset: HFDataset, context_len: int, sequence_stride: int = 1, name: str = "dataset"):
         self.context_len = context_len
-        self.frame_skip = frame_skip
-        self.window_len = context_len + frame_skip
+        self.window_len = context_len
         self.sequence_stride = sequence_stride
         episodes = self._episode_ids(hf_dataset)
         self.valid_indices = self._valid_window_starts(episodes)
@@ -51,8 +50,8 @@ class WMDataset(torch.utils.data.Dataset):
         actions = np.asarray(samples["action"])
         return {
             "frames": torch.from_numpy(frames[: self.context_len]),
-            "target_frame": torch.from_numpy(frames[self.context_len + self.frame_skip - 1]),
-            "actions": torch.from_numpy(actions[: self.context_len + self.frame_skip - 1]).float(),
+            "target_frame": torch.from_numpy(frames[self.context_len - 1]),
+            "actions": torch.from_numpy(actions[: self.context_len - 1]).float(),
         }
 
     def _valid_window_starts(self, episodes: np.ndarray) -> list[int]:
@@ -167,9 +166,6 @@ class WMTrainer(SectionedWandbTrainer):
     wandb_section = "wm"
 
     def __init__(self, *args, sigreg_weight: float = 0.1, sigreg_n_samples: int = 1024, **kwargs):
-        # Removed: rollout_steps, rollout_weight, frame_skip
-        # LeWorldModel uses exactly 2 loss terms: MSE prediction + SIGReg.
-        # The extra rollout loop was causing ~10x slowdown and conflicting gradients.
         super().__init__(*args, **kwargs)
         self.sigreg_weight = sigreg_weight
         self.sigreg_n_samples = sigreg_n_samples
@@ -186,8 +182,8 @@ class WMTrainer(SectionedWandbTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         dtype = next(model.parameters()).dtype
-        frames  = inputs["frames"].to(dtype=dtype) / 255.0   # [B, T, C, H, W]
-        actions = inputs["actions"].to(dtype=dtype)           # [B, T+skip-1, 9]
+        frames  = inputs["frames"].to(dtype=dtype) / 255.0
+        actions = inputs["actions"].to(dtype=dtype)
 
         if self._sigreg_device != frames.device:
             self.sigreg = self.sigreg.to(frames.device)
@@ -195,24 +191,16 @@ class WMTrainer(SectionedWandbTrainer):
 
         T = frames.size(1)
 
-        # Encode all context frames → patch tokens + CLS states.
-        # Gradients flow through BOTH encoder and predictor (end-to-end, as in LeWorldModel).
-        _, tokens = model.encode(frames, return_tokens=True)   # [B, T, n_patches+1, D]
-        states   = tokens[:, :, 0]                             # [B, T, D]  — CLS tokens only
+        _, tokens = model.encode(frames, return_tokens=True)
+        states   = tokens[:, :, 0] # CLS tokens only
 
-        # 1-step teacher-forcing prediction within the context window.
-        # predict(tokens[:, :-1]) at position t uses frames 0..t to predict frame t+1.
-        pred_all = model.predict(tokens[:, :-1], actions[:, :T - 1])  # [B, T-1, n_patches+1, D]
-        pred_cls   = pred_all[:, :, 0]   # [B, T-1, D]
-        target_cls = states[:, 1:]       # [B, T-1, D] — no detach: end-to-end gradient
+        pred_all = model.predict(tokens[:, :-1], actions[:, :T - 1])
+        pred_cls   = pred_all[:, :, 0]
+        target_cls = states[:, 1:]
 
-        # MSE prediction loss (LeWorldModel eq. 1)
         pred_loss = F.mse_loss(pred_cls.float(), target_cls.float())
 
-        # SIGReg on encoder CLS tokens only (LeWorldModel eq. 2-3).
-        # Applied to the encoder's output distribution to prevent collapse.
-        # NOT on patch tokens, NOT on predictor outputs.
-        flat_states = states.flatten(0, 1).float()  # [B*T, D]
+        flat_states = states.flatten(0, 1).float()
         n = min(self.sigreg_n_samples, flat_states.size(0))
         perm = torch.randperm(flat_states.size(0), device=flat_states.device)[:n]
         sigreg_loss = self.sigreg(flat_states[perm])
@@ -317,7 +305,6 @@ def train(
     wm_checkpoint: str | None = None,
     context_len: int = 16,
     sequence_stride: int = 1,
-    frame_skip: int = 4,
     max_eval_sequences: int = 2048,
     dataloader_num_workers: int = 4,
     dataloader_prefetch_factor: int | None = 2,
@@ -335,10 +322,10 @@ def train(
     print(f"Device: {device} | Dataset: {config.to_dict()['height']}x{config.to_dict()['width']} | dim={config.dim} | blocks={config.n_blocks} | heads={config.n_heads}", flush=True)
     ds = load_dataset("lucrbrtv/doom-e1-internet-gameplay", split="train")
     split = ds.train_test_split(test_size=0.1, shuffle=False)
-    train_dataset = WMDataset(split["train"], context_len=context_len, sequence_stride=sequence_stride, frame_skip=frame_skip, name="train")
-    eval_dataset = WMDataset(split["test"], context_len=context_len, sequence_stride=sequence_stride, frame_skip=frame_skip, name="eval")
+    train_dataset = WMDataset(split["train"], context_len=context_len, sequence_stride=sequence_stride, name="train")
+    eval_dataset = WMDataset(split["test"], context_len=context_len, sequence_stride=sequence_stride, name="eval")
     eval_dataset = torch.utils.data.Subset(eval_dataset, range(min(max_eval_sequences, len(eval_dataset))))
-    print(f"Data: {len(ds):,} frames | {len(train_dataset):,} train seqs | {len(eval_dataset):,} eval seqs | context={context_len} | stride={sequence_stride} | frame_skip={frame_skip}", flush=True)
+    print(f"Data: {len(ds):,} frames | {len(train_dataset):,} train seqs | {len(eval_dataset):,} eval seqs | context={context_len} | stride={sequence_stride}", flush=True)
     setup_wandb()
     os.makedirs(output_root, exist_ok=True)
     model = WorldModel(config).to(torch.bfloat16)
@@ -356,8 +343,8 @@ def train(
         output_dir=wm_output_dir,
         num_train_epochs=1,
         max_steps=-1,
-        per_device_train_batch_size=40,
-        per_device_eval_batch_size=40,
+        per_device_train_batch_size=60,
+        per_device_eval_batch_size=60,
         gradient_accumulation_steps=1,
         learning_rate=5e-5,
         warmup_steps=0,
@@ -386,7 +373,6 @@ def train(
         math.ceil(len(train_dataset) / args.per_device_train_batch_size) / args.gradient_accumulation_steps
     )
     total_steps = math.ceil(steps_per_epoch * args.num_train_epochs)
-    eval_batches = math.ceil(len(eval_dataset) / args.per_device_eval_batch_size)
     print(f"Plan: ~{total_steps:,} steps | {args.eval_steps} eval | {args.save_steps} save | bs={args.per_device_train_batch_size} | lr={args.learning_rate}", flush=True)
 
     last_checkpoint = resolve_checkpoint(resume_from, args.output_dir)
@@ -568,7 +554,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-eval-sequences", type=int, default=512)
     parser.add_argument("--dataloader-num-workers", type=int, default=4)
     parser.add_argument("--dataloader-prefetch-factor", type=int, default=2)
-    parser.add_argument("--frame-skip", type=int, default=4, help="Number of frames to skip ahead for world model prediction (k in t+k)")
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -580,7 +565,6 @@ if __name__ == "__main__":
         wm_checkpoint=cli.wm_checkpoint,
         context_len=cli.context_len,
         sequence_stride=cli.sequence_stride,
-        frame_skip=cli.frame_skip,
         max_eval_sequences=cli.max_eval_sequences,
         dataloader_num_workers=cli.dataloader_num_workers,
         dataloader_prefetch_factor=cli.dataloader_prefetch_factor,

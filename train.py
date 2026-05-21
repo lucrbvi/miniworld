@@ -191,14 +191,11 @@ class WMTrainer(SectionedWandbTrainer):
 
         T = frames.size(1)
 
-        _, tokens = model.encode(frames, return_tokens=True)
-        states   = tokens[:, :, 0] # CLS tokens only
+        states = model.encode(frames) # CLS tokens only
+        pred_states = model.predict(states[:, :-1], actions[:, :T - 1])
+        target_states = states[:, 1:]
 
-        pred_all = model.predict(tokens[:, :-1], actions[:, :T - 1])
-        pred_cls   = pred_all[:, :, 0]
-        target_cls = states[:, 1:]
-
-        pred_loss = F.mse_loss(pred_cls.float(), target_cls.float())
+        pred_loss = F.mse_loss(pred_states.float(), target_states.float())
 
         flat_states = states.flatten(0, 1).float()
         n = min(self.sigreg_n_samples, flat_states.size(0))
@@ -217,12 +214,12 @@ class WMTrainer(SectionedWandbTrainer):
                 "z_std_mean": scalar(flat_z.std(dim=0).mean()),
                 "z_std_min": scalar(flat_z.std(dim=0).min()),
                 "z_norm_mean": scalar(flat_z.norm(dim=-1).mean()),
-                "pred_std": scalar(pred_cls.detach().float().std(dim=-1).mean()),
-                "target_std": scalar(target_cls.detach().float().std(dim=-1).mean()),
+                "pred_std": scalar(pred_states.detach().float().std(dim=-1).mean()),
+                "target_std": scalar(target_states.detach().float().std(dim=-1).mean()),
             })
 
         if return_outputs:
-            return loss, {"pred_cls": pred_cls.detach(), "target_cls": target_cls.detach()}
+            return loss, {"pred_states": pred_states.detach(), "target_states": target_states.detach()}
         return loss
 
 def device_name() -> str:
@@ -389,7 +386,7 @@ def train(
 
     if mode in {"all", "wm"}:
         trainer = WMTrainer(
-            model=model, args=args, train_dataset=train_dataset, eval_dataset=eval_dataset, sigreg_weight=0.1,
+            model=model, args=args, train_dataset=train_dataset, eval_dataset=eval_dataset, sigreg_weight=0.01,
         )
         if last_checkpoint is not None:
             print(f"Resume: {last_checkpoint}", flush=True)

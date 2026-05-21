@@ -113,7 +113,7 @@ class Predictor(nn.Module):
     def __init__(self, config: "WorldModelConfig"):
         super().__init__()
         self.action_proj = nn.Linear(config.action_dim, config.dim)
-        self.time_pos = nn.Parameter(torch.randn(1, config.max_seq_len, 1, config.dim) * 0.02)
+        self.time_pos = nn.Parameter(torch.randn(1, config.max_seq_len, config.dim) * 0.02)
         self.blocks = nn.ModuleList([
             AdaLNBlock(config.dim, config.n_heads, config.ffn_mult, config.dropout_proba)
             for _ in range(config.n_blocks)
@@ -122,29 +122,30 @@ class Predictor(nn.Module):
         self.projector = Projector(config.dim)
         self.causal = config.causal
 
-    def forward(self, tokens: Tensor, actions: Tensor) -> Tensor:
-        if tokens.dim() == 3: tokens = tokens.unsqueeze(1)
-        if actions.dim() == 2: actions = actions.unsqueeze(1)
-        b, t, n, d = tokens.shape
+    def forward(self, states: Tensor, actions: Tensor) -> Tensor:
+        if states.dim() == 2:
+            states = states.unsqueeze(1)
+        if actions.dim() == 2:
+            actions = actions.unsqueeze(1)
+        b, t, d = states.shape
         cap = self.time_pos.size(1)
         if t > cap:
             raise ValueError(
                 f"Sequence length {t} exceeds model capacity ({cap}). "
-                f"This means the training loop built a context longer than the Predictor's time_pos size. "
                 f"Check that the data's context_len and the model's max_seq_len are consistent."
             )
-        action_emb = self.action_proj(actions.to(dtype=tokens.dtype))
-        cond = action_emb.unsqueeze(2).expand(-1, -1, n, -1).reshape(b, t * n, d)
-        x = (tokens + self.time_pos[:, :t]).reshape(b, t * n, d)
-        attn_mask = self._block_causal_mask(t, n, x.device, x.dtype) if self.causal else None
+        x = states + self.time_pos[:, :t]
+        cond = self.action_proj(actions.to(dtype=states.dtype))
+        attn_mask = None
+        if self.causal:
+            attn_mask = torch.triu(
+                torch.full((t, t), float("-inf"), device=x.device, dtype=x.dtype), diagonal=1
+            )
         for block in self.blocks:
             x = block(x, cond, attn_mask=attn_mask)
-        return self.projector(self.norm(x)).view(b, t, n, d)
+        return self.projector(self.norm(x))
 
-    @staticmethod
-    def _block_causal_mask(t: int, n: int, device, dtype) -> Tensor:
-        frame_idx = torch.arange(t * n, device=device) // n
-        return torch.where(frame_idx[None, :] > frame_idx[:, None], float("-inf"), 0.0).to(dtype=dtype)
+
 
 class TokenTransition(nn.Module):
     def __init__(self, dim: int, n_heads: int, n_blocks: int = 2, ffn_mult: int = 3, dropout: float = 0.0):
@@ -254,8 +255,6 @@ class WorldModel(PreTrainedModel):
     def predict(self, states: Tensor, actions: Tensor) -> Tensor:
         return self.predictor(states, actions)
 
-    def forward(self, frames: Tensor, actions: Tensor, decode: bool = False):
-        _, tokens = self.encode(frames, return_tokens=True)
-        if not decode: return self.predict(tokens, actions)
-        pred_tokens = self.predict(tokens, actions)
-        return pred_tokens[:, :, 0], self.decoder(self.transition(pred_tokens[:, -1]))
+    def forward(self, frames: Tensor, actions: Tensor):
+        states = self.encode(frames)
+        return self.predict(states, actions)

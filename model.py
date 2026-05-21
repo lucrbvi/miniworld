@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.utils.checkpoint import checkpoint
 from transformers import PreTrainedModel, PretrainedConfig
 
 class MLP(nn.Module):
@@ -39,23 +38,16 @@ class TransformerStack(nn.Module):
             ]))
         self.norm = nn.LayerNorm(dim)
         self.causal = causal
-        self.gradient_checkpointing = False
-
-    def _run_block(self, norm1, attn, norm2, mlp, x: Tensor) -> Tensor:
-        attn_mask = None
-        if self.causal:
-            n = x.size(1)
-            attn_mask = torch.triu(torch.full((n, n), float("-inf"), device=x.device, dtype=x.dtype), diagonal=1)
-        h = norm1(x)
-        x = x + attn(h, h, h, attn_mask=attn_mask, need_weights=False)[0]
-        return x + mlp(norm2(x))
 
     def forward(self, x: Tensor) -> Tensor:
         for norm1, attn, norm2, mlp in self.blocks:
-            if self.gradient_checkpointing and self.training:
-                x = checkpoint(self._run_block, norm1, attn, norm2, mlp, x, use_reentrant=False)
-            else:
-                x = self._run_block(norm1, attn, norm2, mlp, x)
+            attn_mask = None
+            if self.causal:
+                n = x.size(1)
+                attn_mask = torch.triu(torch.full((n, n), float("-inf"), device=x.device, dtype=x.dtype), diagonal=1)
+            h = norm1(x)
+            x = x + attn(h, h, h, attn_mask=attn_mask, need_weights=False)[0]
+            x = x + mlp(norm2(x))
         return self.norm(x)
 
 class ActionPolicy(nn.Module):
@@ -104,19 +96,13 @@ class AdaLNBlock(nn.Module):
         self.mod = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
         nn.init.zeros_(self.mod[-1].weight)
         nn.init.zeros_(self.mod[-1].bias)
-        self.gradient_checkpointing = False
 
-    def _run(self, x: Tensor, cond: Tensor, attn_mask: Tensor | None) -> Tensor:
+    def forward(self, x: Tensor, cond: Tensor, attn_mask: Tensor | None = None) -> Tensor:
         scale_a, shift_a, gate_a, scale_m, shift_m, gate_m = self.mod(cond).chunk(6, dim=-1)
         h = self.norm1(x) * (1 + scale_a) + shift_a
         x = x + gate_a * self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)[0]
         h = self.norm2(x) * (1 + scale_m) + shift_m
         return x + gate_m * self.mlp(h)
-
-    def forward(self, x: Tensor, cond: Tensor, attn_mask: Tensor | None = None) -> Tensor:
-        if self.gradient_checkpointing and self.training:
-            return checkpoint(self._run, x, cond, attn_mask, use_reentrant=False)
-        return self._run(x, cond, attn_mask)
 
 class Predictor(nn.Module):
     def __init__(self, config: "WorldModelConfig"):
@@ -230,7 +216,6 @@ class WorldModelConfig(PretrainedConfig):
 class WorldModel(PreTrainedModel):
     config_class = WorldModelConfig
     all_tied_weights_keys = {}
-    supports_gradient_checkpointing = True
 
     def __init__(self, config: WorldModelConfig):
         super().__init__(config)
@@ -240,16 +225,6 @@ class WorldModel(PreTrainedModel):
         self.transition = TokenTransition(config.dim, config.n_heads, config.transition_n_blocks, config.ffn_mult, config.dropout_proba)
         self.decoder = Decoder(config)
         self._sync_max_seq_len()
-
-    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None) -> None:
-        for module in self.modules():
-            if isinstance(module, (TransformerStack, AdaLNBlock)):
-                module.gradient_checkpointing = True
-
-    def gradient_checkpointing_disable(self) -> None:
-        for module in self.modules():
-            if isinstance(module, (TransformerStack, AdaLNBlock)):
-                module.gradient_checkpointing = False
 
     def _sync_max_seq_len(self) -> None:
         actual = self.predictor.time_pos.size(1)

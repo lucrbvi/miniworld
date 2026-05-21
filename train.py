@@ -189,12 +189,13 @@ class DecoderTrainer(SectionedWandbTrainer):
 class WMTrainer(SectionedWandbTrainer):
     wandb_section = "wm"
 
-    def __init__(self, *args, sigreg_weight: float = 0.1, rollout_steps: int = 6, rollout_weight: float = 2.0, frame_skip: int = 1, **kwargs):
+    def __init__(self, *args, sigreg_weight: float = 0.1, rollout_steps: int = 6, rollout_weight: float = 2.0, frame_skip: int = 1, sigreg_n_samples: int = 1024, **kwargs):
         super().__init__(*args, **kwargs)
         self.sigreg_weight = sigreg_weight
         self.rollout_steps = rollout_steps
         self.rollout_weight = rollout_weight
         self.frame_skip = frame_skip
+        self.sigreg_n_samples = sigreg_n_samples
         self.sigreg = lejepa.multivariate.SlicingUnivariateTest(
             univariate_test=lejepa.univariate.EppsPulley(n_points=17), num_slices=1024,
         )
@@ -240,10 +241,13 @@ class WMTrainer(SectionedWandbTrainer):
             rollout_tokens = torch.cat([rollout_tokens, next_preds.unsqueeze(1)], dim=1)
         rollout_preds = torch.stack(rollout_preds, dim=1)
 
-        sigreg_loss = torch.stack([
-            self.sigreg(tokens[:, t].reshape(-1, tokens.size(-1)).float()) for t in range(tokens.size(1))
-        ]).mean()
-        sigreg_pred_loss = self.sigreg(pred_tokens.reshape(-1, pred_tokens.size(-1)).float())
+        flat_tokens = tokens.flatten(0, 2).float()
+        flat_pred = pred_tokens.flatten(0, 2).float()
+        n = self.sigreg_n_samples
+        idx = torch.randperm(flat_tokens.size(0), device=flat_tokens.device)[:n]
+        sigreg_loss = self.sigreg(flat_tokens[idx])
+        idx_pred = torch.randperm(flat_pred.size(0), device=flat_pred.device)[:n]
+        sigreg_pred_loss = self.sigreg(flat_pred[idx_pred])
 
         pred_n = F.normalize(pred_tokens.float(), dim=-1)
         tgt_n = F.normalize(target_tokens.float(), dim=-1)
@@ -395,8 +399,8 @@ def train(
         output_dir=wm_output_dir,
         num_train_epochs=1,
         max_steps=-1,
-        per_device_train_batch_size=65,
-        per_device_eval_batch_size=65,
+        per_device_train_batch_size=40,
+        per_device_eval_batch_size=40,
         gradient_accumulation_steps=1,
         learning_rate=5e-5,
         warmup_steps=0,
@@ -419,8 +423,6 @@ def train(
         run_name="world-model",
         optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
         torch_compile=True,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 
     steps_per_epoch = math.ceil(

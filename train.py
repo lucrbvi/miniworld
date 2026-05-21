@@ -129,21 +129,34 @@ class DecoderTrainer(SectionedWandbTrainer):
 
         all_frames = torch.cat([frames, target_frame.unsqueeze(1)], dim=1)
         total = all_frames.size(1)
+        T = frames.size(1)
+
+        # Encode all frames, then replace encoder CLS with predicted CLS
+        with torch.no_grad():
+            _, all_tokens = model.encode(all_frames, return_tokens=True)
+            if T >= 2:
+                all_states = all_tokens[:, :, 0]
+                pred_states = model.predict(all_states[:, :T-1], actions[:, :T-1])
+                all_tokens = all_tokens.clone()
+                all_tokens[:, 1:T, 0] = pred_states
+                all_tokens[:, T, 0] = pred_states[:, -1]
+
+        if model.config.decoder_noise_std > 0:
+            all_tokens = all_tokens + torch.randn_like(all_tokens) * model.config.decoder_noise_std
 
         if self.rollout_decode_steps > 0 and total > self.rollout_decode_steps:
             idx = torch.randperm(total, device=frames.device)[:self.rollout_decode_steps].sort().values
-            decode_frames = all_frames[:, idx]
+            decode_tokens = all_tokens[:, idx]
+            tgts = all_frames[:, idx]
+            n_decode = len(idx)
         else:
-            decode_frames = all_frames
+            decode_tokens = all_tokens
+            tgts = all_frames
+            n_decode = total
 
-        with torch.no_grad():
-            _, tokens = model.encode(decode_frames, return_tokens=True)
-            if model.config.decoder_noise_std > 0:
-                tokens = tokens + torch.randn_like(tokens) * model.config.decoder_noise_std
-
-        tokens = model.transition(tokens)
-        recon = model.decoder(tokens).flatten(0, 1)
-        tgts = decode_frames.flatten(0, 1)
+        decode_tokens = model.transition(decode_tokens)
+        recon = model.decoder(decode_tokens).flatten(0, 1)
+        tgts = tgts.flatten(0, 1)
 
         l1_loss = F.l1_loss(recon.float(), tgts.float())
         lpips_loss = self.lpips_loss(recon.float() * 2 - 1, tgts.float() * 2 - 1).mean()
@@ -154,7 +167,7 @@ class DecoderTrainer(SectionedWandbTrainer):
                 "loss": scalar(loss),
                 "l1": scalar(l1_loss),
                 "lpips": scalar(lpips_loss),
-                "decode_steps": decode_frames.size(1),
+                "decode_steps": n_decode,
                 "latent_noise_std": model.config.decoder_noise_std,
             })
 

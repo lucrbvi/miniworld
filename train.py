@@ -107,10 +107,10 @@ def scalar(value: torch.Tensor) -> float:
 class DecoderTrainer(SectionedWandbTrainer):
     wandb_section = "decoder"
 
-    def __init__(self, *args, lpips_weight: float = 0.1, rollout_decode_steps: int = 2, **kwargs):
+    def __init__(self, *args, lpips_weight: float = 0.1, rollout_decode_steps: int = 4, **kwargs):
         super().__init__(*args, **kwargs)
         self.lpips_weight = lpips_weight
-        self.rollout_decode_steps = rollout_decode_steps
+        self.rollout_decode_steps = rollout_decode_steps   # how many frames to decode per batch item
         self.lpips_loss = lpips.LPIPS(net="alex").eval()
         for param in self.lpips_loss.parameters():
             param.requires_grad = False
@@ -125,51 +125,29 @@ class DecoderTrainer(SectionedWandbTrainer):
         dtype = next(model.parameters()).dtype
         frames = inputs["frames"].to(dtype=dtype) / 255.0
         target_frame = inputs["target_frame"].to(dtype=dtype) / 255.0
-        actions = inputs["actions"].to(dtype=dtype)
 
-        model.encoder.eval()
-        model.predictor.eval()
         self.lpips_loss = self.lpips_loss.to(frames.device)
 
+        all_frames = torch.cat([frames, target_frame.unsqueeze(1)], dim=1)
+        total = all_frames.size(1)
+
+        if self.rollout_decode_steps > 0 and total > self.rollout_decode_steps:
+            idx = torch.randperm(total, device=frames.device)[:self.rollout_decode_steps].sort().values
+            decode_frames = all_frames[:, idx]
+        else:
+            decode_frames = all_frames
+
         with torch.no_grad():
-            observations = torch.cat([frames, target_frame.unsqueeze(1)], dim=1)
-            _, tokens = model.encode(observations, return_tokens=True)
-            b, t, n_p1, d = tokens.shape
-
-            if self.state.max_steps <= 0:
-                progress = 0.0
-            else:
-                end_step = max(1.0, self.state.max_steps * model.config.decoder_curriculum_end)
-                progress = min(1.0, self.state.global_step / end_step)
-            pred_ratio = model.config.decoder_pred_token_ratio * progress
-
-            steps = min(t - 1, model.predictor.time_pos.size(1) - 1)
-            latents = torch.empty(b, steps, n_p1, d, dtype=tokens.dtype, device=tokens.device)
-            context = tokens[:, :1].contiguous()
-            for s in range(steps):
-                pred = model.predict(context, actions[:, :s + 1])
-                next_pred = pred[:, -1]
-                latents[:, s] = next_pred
-                use_teacher = torch.rand(b, 1, 1, 1, device=next_pred.device) >= pred_ratio
-                next_token = torch.where(use_teacher, tokens[:, s + 1:s + 2], next_pred.unsqueeze(1))
-                context = torch.cat([context, next_token], dim=1)
-
-            if self.rollout_decode_steps > 0 and steps > self.rollout_decode_steps:
-                step_idx = torch.randperm(steps, device=latents.device)[:self.rollout_decode_steps].sort().values
-                latents = latents[:, step_idx]
-                targets = observations[:, 1:][:, step_idx]
-            else:
-                targets = observations[:, 1:]
-
-            latents = model.transition(latents)
-
+            _, tokens = model.encode(decode_frames, return_tokens=True)
             if model.config.decoder_noise_std > 0:
-                latents = latents + torch.randn_like(latents) * model.config.decoder_noise_std
+                tokens = tokens + torch.randn_like(tokens) * model.config.decoder_noise_std
 
-        recon = model.decoder(latents).flatten(0, 1)
-        targets = targets.flatten(0, 1)
-        l1_loss = F.l1_loss(recon.float(), targets.float())
-        lpips_loss = self.lpips_loss(recon.float() * 2 - 1, targets.float() * 2 - 1).mean()
+        tokens = model.transition(tokens)
+        recon = model.decoder(tokens).flatten(0, 1)
+        tgts = decode_frames.flatten(0, 1)
+
+        l1_loss = F.l1_loss(recon.float(), tgts.float())
+        lpips_loss = self.lpips_loss(recon.float() * 2 - 1, tgts.float() * 2 - 1).mean()
         loss = l1_loss + self.lpips_weight * lpips_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
@@ -177,8 +155,7 @@ class DecoderTrainer(SectionedWandbTrainer):
                 "loss": scalar(loss),
                 "l1": scalar(l1_loss),
                 "lpips": scalar(lpips_loss),
-                "pred_token_ratio": pred_ratio,
-                "decode_steps": latents.size(1),
+                "decode_steps": decode_frames.size(1),
                 "latent_noise_std": model.config.decoder_noise_std,
             })
 
@@ -189,12 +166,12 @@ class DecoderTrainer(SectionedWandbTrainer):
 class WMTrainer(SectionedWandbTrainer):
     wandb_section = "wm"
 
-    def __init__(self, *args, sigreg_weight: float = 0.1, rollout_steps: int = 6, rollout_weight: float = 2.0, frame_skip: int = 1, sigreg_n_samples: int = 1024, **kwargs):
+    def __init__(self, *args, sigreg_weight: float = 0.1, sigreg_n_samples: int = 1024, **kwargs):
+        # Removed: rollout_steps, rollout_weight, frame_skip
+        # LeWorldModel uses exactly 2 loss terms: MSE prediction + SIGReg.
+        # The extra rollout loop was causing ~10x slowdown and conflicting gradients.
         super().__init__(*args, **kwargs)
         self.sigreg_weight = sigreg_weight
-        self.rollout_steps = rollout_steps
-        self.rollout_weight = rollout_weight
-        self.frame_skip = frame_skip
         self.sigreg_n_samples = sigreg_n_samples
         self.sigreg = lejepa.multivariate.SlicingUnivariateTest(
             univariate_test=lejepa.univariate.EppsPulley(n_points=17), num_slices=1024,
@@ -209,75 +186,55 @@ class WMTrainer(SectionedWandbTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         dtype = next(model.parameters()).dtype
-        frames = inputs["frames"].to(dtype=dtype) / 255.0
-        target_frame = (inputs["target_frame"].to(dtype=dtype) / 255.0).unsqueeze(1)
-        actions = inputs["actions"].to(dtype=dtype)
+        frames  = inputs["frames"].to(dtype=dtype) / 255.0   # [B, T, C, H, W]
+        actions = inputs["actions"].to(dtype=dtype)           # [B, T+skip-1, 9]
 
         if self._sigreg_device != frames.device:
             self.sigreg = self.sigreg.to(frames.device)
             self._sigreg_device = frames.device
 
-        observations = torch.cat([frames, target_frame], dim=1)
-        embeddings, tokens = model.encode(observations, return_tokens=True)
+        T = frames.size(1)
 
-        context_len = frames.size(1)
-        context_tokens = tokens[:, :context_len]
-        target_tokens = tokens[:, context_len:context_len + 1]
+        # Encode all context frames → patch tokens + CLS states.
+        # Gradients flow through BOTH encoder and predictor (end-to-end, as in LeWorldModel).
+        _, tokens = model.encode(frames, return_tokens=True)   # [B, T, n_patches+1, D]
+        states   = tokens[:, :, 0]                             # [B, T, D]  — CLS tokens only
 
-        # k-step rollout from last context frame using actions [t, t+k-1]
-        rollout = context_tokens
-        for step in range(self.frame_skip):
-            pred = model.predict(rollout, actions[:, :context_len + step])
-            next_token = pred[:, -1:]
-            rollout = torch.cat([rollout, next_token], dim=1)
-        pred_tokens = rollout[:, context_len + self.frame_skip - 1:context_len + self.frame_skip]
+        # 1-step teacher-forcing prediction within the context window.
+        # predict(tokens[:, :-1]) at position t uses frames 0..t to predict frame t+1.
+        pred_all = model.predict(tokens[:, :-1], actions[:, :T - 1])  # [B, T-1, n_patches+1, D]
+        pred_cls   = pred_all[:, :, 0]   # [B, T-1, D]
+        target_cls = states[:, 1:]       # [B, T-1, D] — no detach: end-to-end gradient
 
-        rollout_len = min(self.rollout_steps, context_len - 1, model.predictor.time_pos.size(1) - 1)
-        rollout_preds = []
-        rollout_tokens = tokens[:, :1]
-        for t in range(rollout_len):
-            next_preds = model.predict(rollout_tokens, actions[:, : t + 1])[:, -1]
-            rollout_preds.append(next_preds)
-            rollout_tokens = torch.cat([rollout_tokens, next_preds.unsqueeze(1)], dim=1)
-        rollout_preds = torch.stack(rollout_preds, dim=1)
+        # MSE prediction loss (LeWorldModel eq. 1)
+        pred_loss = F.mse_loss(pred_cls.float(), target_cls.float())
 
-        flat_tokens = tokens.flatten(0, 2).float()
-        flat_pred = pred_tokens.flatten(0, 2).float()
-        n = self.sigreg_n_samples
-        idx = torch.randperm(flat_tokens.size(0), device=flat_tokens.device)[:n]
-        sigreg_loss = self.sigreg(flat_tokens[idx])
-        idx_pred = torch.randperm(flat_pred.size(0), device=flat_pred.device)[:n]
-        sigreg_pred_loss = self.sigreg(flat_pred[idx_pred])
+        # SIGReg on encoder CLS tokens only (LeWorldModel eq. 2-3).
+        # Applied to the encoder's output distribution to prevent collapse.
+        # NOT on patch tokens, NOT on predictor outputs.
+        flat_states = states.flatten(0, 1).float()  # [B*T, D]
+        n = min(self.sigreg_n_samples, flat_states.size(0))
+        perm = torch.randperm(flat_states.size(0), device=flat_states.device)[:n]
+        sigreg_loss = self.sigreg(flat_states[perm])
 
-        pred_n = F.normalize(pred_tokens.float(), dim=-1)
-        tgt_n = F.normalize(target_tokens.float(), dim=-1)
-        pred_loss = 1.0 - (pred_n * tgt_n).sum(-1).mean()
-
-        rl_n = F.normalize(rollout_preds.float(), dim=-1)
-        rl_tgt_n = F.normalize(tokens[:, 1 : 1 + rollout_len].float(), dim=-1)
-        rollout_loss = (1.0 - (rl_n * rl_tgt_n).sum(-1)).mean()
-        loss = pred_loss + self.rollout_weight * rollout_loss + self.sigreg_weight * (sigreg_loss + sigreg_pred_loss)
+        loss = pred_loss + self.sigreg_weight * sigreg_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
-            flat_z = tokens.flatten(0, 2)
+            with torch.no_grad():
+                flat_z = states.flatten(0, 1).float()
             self.log({
                 "loss_total": scalar(loss),
                 "pred_loss": scalar(pred_loss),
-                "rollout_loss": scalar(rollout_loss),
                 "sigreg": scalar(sigreg_loss),
-                "sigreg_pred": scalar(sigreg_pred_loss),
                 "z_std_mean": scalar(flat_z.std(dim=0).mean()),
                 "z_std_min": scalar(flat_z.std(dim=0).min()),
                 "z_norm_mean": scalar(flat_z.norm(dim=-1).mean()),
-                "patch_spatial_std": scalar(tokens[:, :, 1:].std(dim=2).mean()),
-                "pred_std": scalar(pred_tokens.flatten(0, 2).std(dim=0).mean()),
-                "target_std": scalar(target_tokens.flatten(0, 2).std(dim=0).mean()),
-                "pred_target_std_ratio": scalar(pred_tokens.flatten(0, 2).std(dim=0).mean() / target_tokens.flatten(0, 2).std(dim=0).mean().clamp_min(1e-6)),
-                "frame_skip": self.frame_skip,
+                "pred_std": scalar(pred_cls.detach().float().std(dim=-1).mean()),
+                "target_std": scalar(target_cls.detach().float().std(dim=-1).mean()),
             })
 
         if return_outputs:
-            return loss, {"pred_tokens": pred_tokens.detach(), "target_embeddings": embeddings[:, 1:].detach()}
+            return loss, {"pred_cls": pred_cls.detach(), "target_cls": target_cls.detach()}
         return loss
 
 def device_name() -> str:
@@ -303,7 +260,7 @@ def compute_action_pos_weight(hf_dataset: HFDataset, n_buttons: int = 9) -> torc
     flat = actions.reshape(-1, n_buttons)
     n_pos = flat.sum(axis=0).clip(min=1)
     n_neg = (len(flat) - flat.sum(axis=0)).clip(min=1)
-    weights = n_neg / n_pos
+    weights = np.sqrt(n_neg / n_pos)
     print(f"pos_weight: {dict(zip(ACTION_NAMES, np.round(weights, 2).tolist()))}", flush=True)
     return torch.from_numpy(weights.astype(np.float32))
 
@@ -446,7 +403,7 @@ def train(
 
     if mode in {"all", "wm"}:
         trainer = WMTrainer(
-            model=model, args=args, train_dataset=train_dataset, eval_dataset=eval_dataset, sigreg_weight=0.1, frame_skip=frame_skip,
+            model=model, args=args, train_dataset=train_dataset, eval_dataset=eval_dataset, sigreg_weight=0.1,
         )
         if last_checkpoint is not None:
             print(f"Resume: {last_checkpoint}", flush=True)

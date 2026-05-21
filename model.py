@@ -17,13 +17,18 @@ class MLP(nn.Module):
         return self.net(x)
 
 class Projector(nn.Module):
-    def __init__(self, dim: int, hidden_mult: int = 4, dropout: float = 0.0):
+    def __init__(self, dim: int, hidden_mult: int = 2):
         super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.mlp = MLP(dim, dim * hidden_mult, dim, dropout)
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim * hidden_mult),
+            nn.BatchNorm1d(dim * hidden_mult),
+            nn.GELU(),
+            nn.Linear(dim * hidden_mult, dim),
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-        return x + self.mlp(self.norm(x))
+        lead = x.shape[:-1]
+        return self.net(x.reshape(-1, x.shape[-1])).reshape(*lead, x.shape[-1])
 
 class TransformerStack(nn.Module):
     def __init__(self, dim: int, n_heads: int, n_blocks: int, ffn_mult: int, dropout: float, causal: bool = False):

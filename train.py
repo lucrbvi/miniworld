@@ -106,10 +106,9 @@ def scalar(value: torch.Tensor) -> float:
 class DecoderTrainer(SectionedWandbTrainer):
     wandb_section = "decoder"
 
-    def __init__(self, *args, lpips_weight: float = 0.1, rollout_decode_steps: int = 4, **kwargs):
+    def __init__(self, *args, lpips_weight: float = 0.2, **kwargs):
         super().__init__(*args, **kwargs)
         self.lpips_weight = lpips_weight
-        self.rollout_decode_steps = rollout_decode_steps   # how many frames to decode per batch item
         self.lpips_loss = lpips.LPIPS(net="alex").eval()
         for param in self.lpips_loss.parameters():
             param.requires_grad = False
@@ -123,52 +122,23 @@ class DecoderTrainer(SectionedWandbTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         dtype = next(model.parameters()).dtype
         frames = inputs["frames"].to(dtype=dtype) / 255.0
-        target_frame = inputs["target_frame"].to(dtype=dtype) / 255.0
+        T = frames.size(1)
 
         self.lpips_loss = self.lpips_loss.to(frames.device)
 
-        all_frames = torch.cat([frames, target_frame.unsqueeze(1)], dim=1)
-        total = all_frames.size(1)
-        T = frames.size(1)
-
-        # Encode all frames, then replace encoder CLS with predicted CLS
         with torch.no_grad():
-            _, all_tokens = model.encode(all_frames, return_tokens=True)
-            if T >= 2:
-                all_states = all_tokens[:, :, 0]
-                pred_states = model.predict(all_states[:, :T-1], actions[:, :T-1])
-                all_tokens = all_tokens.clone()
-                all_tokens[:, 1:T, 0] = pred_states
-                all_tokens[:, T, 0] = pred_states[:, -1]
+            states = model.encode(frames)
 
-        if model.config.decoder_noise_std > 0:
-            all_tokens = all_tokens + torch.randn_like(all_tokens) * model.config.decoder_noise_std
+        recon = model.decode(states).flatten(0, 1)
+        targets = frames.flatten(0, 1)
 
-        if self.rollout_decode_steps > 0 and total > self.rollout_decode_steps:
-            idx = torch.randperm(total, device=frames.device)[:self.rollout_decode_steps].sort().values
-            decode_tokens = all_tokens[:, idx]
-            tgts = all_frames[:, idx]
-            n_decode = len(idx)
-        else:
-            decode_tokens = all_tokens
-            tgts = all_frames
-            n_decode = total
-
-        decode_tokens = model.transition(decode_tokens)
-        recon = model.decoder(decode_tokens).flatten(0, 1)
-        tgts = tgts.flatten(0, 1)
-
-        l1_loss = F.l1_loss(recon.float(), tgts.float())
-        lpips_loss = self.lpips_loss(recon.float() * 2 - 1, tgts.float() * 2 - 1).mean()
+        l1_loss = F.l1_loss(recon.float(), targets.float())
+        lpips_loss = self.lpips_loss(recon.float() * 2 - 1, targets.float() * 2 - 1).mean()
         loss = l1_loss + self.lpips_weight * lpips_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
             self.log({
-                "loss": scalar(loss),
-                "l1": scalar(l1_loss),
-                "lpips": scalar(lpips_loss),
-                "decode_steps": n_decode,
-                "latent_noise_std": model.config.decoder_noise_std,
+                "loss": scalar(loss), "l1": scalar(l1_loss), "lpips": scalar(lpips_loss),
             })
 
         if return_outputs:
@@ -195,7 +165,7 @@ class WMTrainer(SectionedWandbTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         dtype = next(model.parameters()).dtype
-        frames  = inputs["frames"].to(dtype=dtype) / 255.0
+        frames = inputs["frames"].to(dtype=dtype) / 255.0
         actions = inputs["actions"].to(dtype=dtype)
 
         if self._sigreg_device != frames.device:
@@ -204,7 +174,7 @@ class WMTrainer(SectionedWandbTrainer):
 
         T = frames.size(1)
 
-        states = model.encode(frames) # CLS tokens only
+        states = model.encode(frames)
         pred_states = model.predict(states[:, :-1], actions[:, :T - 1])
         target_states = states[:, 1:]
 
@@ -287,7 +257,9 @@ class ActionPolicyTrainer(SectionedWandbTrainer):
         with torch.no_grad():
             states = self.wm_model.encode(frames)
 
-        logits = model(states)
+        logits = model(states, past_actions=actions)
+        logits = logits[:, :-1]
+
         pos_weight = self.pos_weight.to(device=logits.device, dtype=logits.dtype) if self.pos_weight is not None else None
         loss = F.binary_cross_entropy_with_logits(logits, actions, pos_weight=pos_weight)
 
@@ -341,9 +313,8 @@ def train(
     model = WorldModel(config).to(torch.bfloat16)
     enc = sum(p.numel() for p in model.encoder.parameters())
     pred = sum(p.numel() for p in model.predictor.parameters())
-    trans = sum(p.numel() for p in model.transition.parameters())
     dec = sum(p.numel() for p in model.decoder.parameters())
-    print(f"Model: {enc+pred+trans+dec:,} total | enc {enc:,} | pred {pred:,} | dec+trans {dec+trans:,}", flush=True)
+    print(f"Model: {enc+pred+dec:,} total | enc {enc:,} | pred {pred:,} | dec {dec:,}", flush=True)
 
     wm_output_dir = os.path.join(output_root, "world-model")
     decoder_output_dir = os.path.join(output_root, "decoder")
@@ -472,15 +443,12 @@ def train(
 
     model.requires_grad_(False)
     model.decoder.requires_grad_(True)
-    model.transition.requires_grad_(True)
     model.eval()
     model.decoder.train()
-    model.transition.train()
     if device == "cuda":
         model.decoder = torch.compile(model.decoder)
-        model.transition = torch.compile(model.transition)
-    dt_params = sum(p.numel() for p in model.decoder.parameters()) + sum(p.numel() for p in model.transition.parameters())
-    print(f"Phase: training decoder + transition ({dt_params:,} params, torch.compile={device=='cuda'})", flush=True)
+    dt_params = sum(p.numel() for p in model.decoder.parameters())
+    print(f"Phase: training decoder ({dt_params:,} params, torch.compile={device=='cuda'})", flush=True)
 
     decoder_args = TrainingArguments(
         output_dir=decoder_output_dir,
@@ -513,8 +481,6 @@ def train(
     trainer.train(resume_from_checkpoint=decoder_checkpoint)
     if hasattr(trainer.model.decoder, "_orig_mod"):
         trainer.model.decoder = trainer.model.decoder._orig_mod
-    if hasattr(trainer.model.transition, "_orig_mod"):
-        trainer.model.transition = trainer.model.transition._orig_mod
     trainer.model.to(torch.bfloat16)
     trainer.save_model(decoder_args.output_dir)
     finish_wandb()
@@ -579,7 +545,6 @@ if __name__ == "__main__":
         dataloader_num_workers=cli.dataloader_num_workers,
         dataloader_prefetch_factor=cli.dataloader_prefetch_factor,
         config=WorldModelConfig(
-            height=240, width=320, patch_size=20, dim=380, n_heads=4, n_blocks=3,
-            ffn_mult=3, dropout_proba=0.1, causal=True,
+            height=240, width=320, patch_size=20, dim=408, n_heads=6,
         ),
     )

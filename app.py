@@ -1,11 +1,8 @@
 """
-HuggingFace Space Doom World Model interactive demo.
-Deploy alongside model.py in the Space repo.
+HuggingFace Space demo with ZeroGPU.
 """
 
-import os
-
-import functools
+from functools import partial
 
 import gradio as gr
 import numpy as np
@@ -18,8 +15,7 @@ try:
     import spaces
     HAS_ZERO_GPU = True
 except ImportError:
-    # Running locally without ZeroGPU — create a no-op decorator
-    class spaces:  # type: ignore[no-redef]
+    class spaces:
         @staticmethod
         def GPU(fn):
             return fn
@@ -28,20 +24,20 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-MODEL_REPO = "lucrbrtv/doom-worldmodel"  # HF Hub repo with the weights
-MAX_CONTEXT = 8   # sliding window length fed to the predictor
+MODEL_REPO = "lucrbrtv/doom-worldmodel"
+MAX_CONTEXT = 8
 HEIGHT, WIDTH = 240, 320
 
 ACTIONS: dict[str, list[float]] = {
-    "Forward":      [1, 0, 0, 0, 0, 0, 0, 0, 0],
-    "Back":         [0, 1, 0, 0, 0, 0, 0, 0, 0],
-    "Strafe Left":  [0, 0, 1, 0, 0, 0, 0, 0, 0],
+    "Forward": [1, 0, 0, 0, 0, 0, 0, 0, 0],
+    "Back": [0, 1, 0, 0, 0, 0, 0, 0, 0],
+    "Strafe Left": [0, 0, 1, 0, 0, 0, 0, 0, 0],
     "Strafe Right": [0, 0, 0, 1, 0, 0, 0, 0, 0],
-    "Turn Left":    [0, 0, 0, 0, 1, 0, 0, 0, 0],
-    "Turn Right":   [0, 0, 0, 0, 0, 1, 0, 0, 0],
-    "Attack":       [0, 0, 0, 0, 0, 0, 1, 0, 0],
-    "Use":          [0, 0, 0, 0, 0, 0, 0, 1, 0],
-    "Idle":         [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    "Turn Left": [0, 0, 0, 0, 1, 0, 0, 0, 0],
+    "Turn Right": [0, 0, 0, 0, 0, 1, 0, 0, 0],
+    "Attack": [0, 0, 0, 0, 0, 0, 1, 0, 0],
+    "Use": [0, 0, 0, 0, 0, 0, 0, 1, 0],
+    "Idle": [0, 0, 0, 0, 0, 0, 0, 0, 0],
 }
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -66,13 +62,11 @@ def get_model() -> WorldModel:
 # ---------------------------------------------------------------------------
 
 def _frame_to_tensor(frame: np.ndarray) -> torch.Tensor:
-    """HWC uint8 numpy → CHW float16 CUDA tensor in [0, 1]."""
     chw = np.ascontiguousarray(np.transpose(frame.astype(np.float32), (2, 0, 1)))
     return torch.from_numpy(chw).to(device=DEVICE, dtype=torch.float16) / 255.0
 
 
 def _tensor_to_pil(t: torch.Tensor) -> Image.Image:
-    """CHW float tensor in [0, 1] → PIL Image."""
     arr = t.mul(255).clamp(0, 255).byte().cpu().numpy()
     return Image.fromarray(np.transpose(arr, (1, 2, 0)))
 
@@ -83,55 +77,46 @@ def _tensor_to_pil(t: torch.Tensor) -> Image.Image:
 
 @spaces.GPU
 def initialize(init_image: np.ndarray | None):
-    """Encode the initial frame and return the starting state."""
     if init_image is None:
-        return gr.update(), None, [], 0
+        return None, None, [], 0, "Steps: 0"
 
     m = get_model().to(DEVICE)
 
     pil = Image.fromarray(init_image).convert("RGB").resize((WIDTH, HEIGHT), Image.BILINEAR)
-    frame = np.array(pil)
-    ft = _frame_to_tensor(frame)
+    ft = _frame_to_tensor(np.array(pil))
 
     with torch.inference_mode():
-        _, tokens = m.encode(ft.unsqueeze(0).unsqueeze(0), return_tokens=True)
+        states = m.encode(ft.unsqueeze(0).unsqueeze(0))
 
-    # (1, 1, n_patches+1, dim) — store on CPU between calls
-    token_history = tokens.cpu()
-
-    return pil, token_history, [], 0, "Steps: 0"
+    return pil, states.cpu(), [], 0, "Steps: 0"
 
 
 @spaces.GPU
-def step(action_name: str, token_history, actions_list: list, step_count: int):
-    """Run one world-model prediction step for the given action."""
-    if token_history is None:
-        return gr.update(), None, [], 0
+def step(action_name: str, cls_history, actions_list: list, step_count: int):
+    if cls_history is None:
+        return None, None, [], 0, "Steps: 0"
 
     m = get_model().to(DEVICE)
     action = ACTIONS[action_name]
     actions_list = actions_list + [action]
 
-    token_history = token_history.to(device=DEVICE, dtype=torch.float16)
-    t = token_history.size(1)
+    cls_history = cls_history.to(device=DEVICE, dtype=torch.float16)
+    t = cls_history.size(1)
 
-    # Build action tensor aligned with token history length
-    action_slice = actions_list[-t:]
-    action_tensor = torch.tensor(action_slice, device=DEVICE, dtype=torch.float16).unsqueeze(0)
+    action_tensor = torch.tensor(actions_list[-t:], device=DEVICE, dtype=torch.float16).unsqueeze(0)
 
     with torch.inference_mode():
-        predicted_tokens = m.predict(token_history, action_tensor)[:, -1]   # (1, n+1, d)
-        pixel_pred = m.decoder(m.transition(predicted_tokens))[0]           # (C, H, W)
+        pred = m.predict(cls_history, action_tensor)[:, -1]
+        frame = m.decode(pred)[0]
 
-    next_tok = predicted_tokens.unsqueeze(1)  # (1, 1, n+1, d)
+    next_cls = pred.unsqueeze(1)
     if t < MAX_CONTEXT:
-        token_history = torch.cat([token_history, next_tok], dim=1)
+        cls_history = torch.cat([cls_history, next_cls], dim=1)
     else:
-        token_history = torch.cat([token_history[:, 1:], next_tok], dim=1)
+        cls_history = torch.cat([cls_history[:, 1:], next_cls], dim=1)
         actions_list = actions_list[-MAX_CONTEXT:]
 
-    new_count = step_count + 1
-    return _tensor_to_pil(pixel_pred), token_history.cpu(), actions_list, new_count, f"Steps: {new_count}"
+    return _tensor_to_pil(frame), cls_history.cpu(), actions_list, step_count + 1, f"Steps: {step_count + 1}"
 
 
 # ---------------------------------------------------------------------------
@@ -170,10 +155,9 @@ CSS = """
 """
 
 with gr.Blocks(title="Doom World Model", css=CSS, js=_JS) as demo:
-    # ---- session state ----
-    token_state  = gr.State(value=None)
+    token_state = gr.State(value=None)
     actions_state = gr.State(value=[])
-    step_count   = gr.State(value=0)
+    step_count = gr.State(value=0)
 
     gr.Markdown(
         "# Doom World Model\n"
@@ -184,7 +168,6 @@ with gr.Blocks(title="Doom World Model", css=CSS, js=_JS) as demo:
     )
 
     with gr.Row():
-        # ---- main display ----
         with gr.Column(scale=3):
             frame_out = gr.Image(
                 label="World Model Output",
@@ -195,7 +178,6 @@ with gr.Blocks(title="Doom World Model", css=CSS, js=_JS) as demo:
             )
             steps_out = gr.Markdown("Steps: 0")
 
-        # ---- controls ----
         with gr.Column(scale=1, min_width=220):
             gr.Markdown("### Initialize")
             init_img = gr.Image(label="Initial frame", type="numpy", height=150)
@@ -203,42 +185,40 @@ with gr.Blocks(title="Doom World Model", css=CSS, js=_JS) as demo:
 
             gr.Markdown("### Actions")
             with gr.Row():
-                b_tleft  = gr.Button("↺ Turn L",  elem_id="btn_tleft",  elem_classes="action-btn")
-                b_fwd    = gr.Button("↑ Forward",  elem_id="btn_fwd",    elem_classes=["action-btn", "primary-action"])
-                b_tright = gr.Button("↻ Turn R",   elem_id="btn_tright", elem_classes="action-btn")
+                b_tleft = gr.Button("↺ Turn L", elem_id="btn_tleft", elem_classes="action-btn")
+                b_fwd = gr.Button("↑ Forward", elem_id="btn_fwd", elem_classes=["action-btn", "primary-action"])
+                b_tright = gr.Button("↻ Turn R", elem_id="btn_tright", elem_classes="action-btn")
             with gr.Row():
-                b_sleft  = gr.Button("← Strafe",   elem_id="btn_sleft",  elem_classes="action-btn")
-                b_back   = gr.Button("↓ Back",      elem_id="btn_back",   elem_classes="action-btn")
-                b_sright = gr.Button("Strafe →",    elem_id="btn_sright", elem_classes="action-btn")
+                b_sleft = gr.Button("← Strafe", elem_id="btn_sleft", elem_classes="action-btn")
+                b_back = gr.Button("↓ Back", elem_id="btn_back", elem_classes="action-btn")
+                b_sright = gr.Button("Strafe →", elem_id="btn_sright", elem_classes="action-btn")
             with gr.Row():
-                b_attack = gr.Button("🔫 Attack",   elem_id="btn_attack", elem_classes=["action-btn", "primary-action"])
-                b_use    = gr.Button("🚪 Use",       elem_id="btn_use",    elem_classes="action-btn")
-                b_idle   = gr.Button("Idle",         elem_id="btn_idle",   elem_classes="action-btn")
+                b_attack = gr.Button("🔫 Attack", elem_id="btn_attack", elem_classes=["action-btn", "primary-action"])
+                b_use = gr.Button("🚪 Use", elem_id="btn_use", elem_classes="action-btn")
+                b_idle = gr.Button("Idle", elem_id="btn_idle", elem_classes="action-btn")
 
-    # ---- init handler ----
     init_btn.click(
         fn=initialize,
         inputs=[init_img],
         outputs=[frame_out, token_state, actions_state, step_count, steps_out],
     )
 
-    # ---- action handlers ----
-    _STEP_INPUTS  = [token_state, actions_state, step_count]
+    _STEP_INPUTS = [token_state, actions_state, step_count]
     _STEP_OUTPUTS = [frame_out, token_state, actions_state, step_count, steps_out]
 
     for btn, action_name in [
-        (b_fwd,    "Forward"),
-        (b_back,   "Back"),
-        (b_sleft,  "Strafe Left"),
+        (b_fwd, "Forward"),
+        (b_back, "Back"),
+        (b_sleft, "Strafe Left"),
         (b_sright, "Strafe Right"),
-        (b_tleft,  "Turn Left"),
+        (b_tleft, "Turn Left"),
         (b_tright, "Turn Right"),
         (b_attack, "Attack"),
-        (b_use,    "Use"),
-        (b_idle,   "Idle"),
+        (b_use, "Use"),
+        (b_idle, "Idle"),
     ]:
         btn.click(
-            fn=functools.partial(step, action_name),
+            fn=partial(step, action_name),
             inputs=_STEP_INPUTS,
             outputs=_STEP_OUTPUTS,
         )

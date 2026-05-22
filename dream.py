@@ -83,7 +83,7 @@ def load_state_dict_checked(model: WorldModel, state_dict: dict[str, torch.Tenso
             raise
         filtered = {k: v for k, v in state_dict.items() if not k.startswith("decoder.")}
         result = model.load_state_dict(filtered, strict=False)
-        optional_prefixes = ("decoder.", "transition.")
+        optional_prefixes = ("decoder.",)
         old_keys = {"predictor.cls_token", "predictor.kind_pos"}
         bad_missing = [k for k in result.missing_keys if not k.startswith(optional_prefixes)]
         bad_unexpected = [k for k in result.unexpected_keys if not k.startswith(optional_prefixes) and k not in old_keys]
@@ -187,43 +187,45 @@ def autocast_context(device: str, enabled: bool, is_half: bool = False):
 @torch.inference_mode()
 def encode_frame(model: WorldModel, frame: torch.Tensor, device: str, amp: bool) -> torch.Tensor:
     with autocast_context(device, amp, frame.dtype == torch.float16):
-        _, tokens = model.encode(frame.unsqueeze(0).unsqueeze(0), return_tokens=True)
-    return tokens[:, 0]
+        states = model.encode(frame.unsqueeze(0).unsqueeze(0))
+    return states[:, 0]
 
 @torch.inference_mode()
 def predict_next_frame(
     model: WorldModel,
-    token_history: torch.Tensor,
+    cls_history: torch.Tensor,
     actions: list[list[float]] | torch.Tensor,
     max_context_len: int,
     device: str,
     amp: bool,
-) -> tuple[torch.Tensor, torch.Tensor, list[list[float]] | torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, list]:
     if isinstance(actions, list):
-        actions = actions[-token_history.size(1):]
-        action_tensor = torch.tensor(actions, device=device, dtype=token_history.dtype).unsqueeze(0)
+        n = cls_history.size(1)
+        action_tensor = torch.tensor(actions[-n:], device=device, dtype=cls_history.dtype).unsqueeze(0)
     else:
         action_tensor = actions
-    with autocast_context(device, amp, token_history.dtype == torch.float16):
-        predicted_tokens = model.predict(token_history, action_tensor)[:, -1]
-        if predicted_tokens.size(1) != model.n_patches + 1:
-            raise ValueError("Predictor must return CLS + all patch tokens for decoding")
-        pixel_pred = model.decoder(model.transition(predicted_tokens))[0]
 
-    next_tok = predicted_tokens.unsqueeze(1)
-    if token_history.size(1) < max_context_len:
-        token_history = torch.cat([token_history, next_tok], dim=1)
+    with autocast_context(device, amp, cls_history.dtype == torch.float16):
+        pred_cls = model.predict(cls_history, action_tensor)[:, -1]
+        pixel_pred = model.decode(pred_cls)[0]
+
+    pred_cls_t = pred_cls.unsqueeze(1)
+    if cls_history.size(1) < max_context_len:
+        new_cls_history = torch.cat([cls_history, pred_cls_t], dim=1)
     else:
-        token_history = torch.cat([token_history[:, 1:], next_tok], dim=1)
-        actions = actions[-max_context_len + 1:]
-    return pixel_pred, token_history, actions
+        new_cls_history = torch.cat([cls_history[:, 1:], pred_cls_t], dim=1)
+        if isinstance(actions, list):
+            actions = actions[-(max_context_len - 1):]
+
+    return pixel_pred, new_cls_history, actions
+
 
 def draw_ui(action: list[float], fps: float, generated_count: int) -> None:
     active = [name for name, value in zip(ACTION_NAMES, action) if value]
     rl.draw_rectangle(0, 0, 320, 88, rl.fade(rl.BLACK, 0.65))
     rl.draw_text("World Model", 10, 8, 18, rl.RAYWHITE)
     rl.draw_text(f"Frames generated: {generated_count}", 10, 30, 16, rl.LIGHTGRAY)
-    rl.draw_text(f"Inputs: {', '.join(active) if active else 'none'}", 10, 52, 16, rl.LIGHTGRAY)
+    rl.draw_text(f"Inputs: {", ".join(active) if active else "none"}", 10, 52, 16, rl.LIGHTGRAY)
     rl.draw_text(f"Target FPS: {fps:g}", 10, 70, 14, rl.GRAY)
 
 @torch.inference_mode()
@@ -240,8 +242,9 @@ def run(args: argparse.Namespace) -> None:
     config = model.config
     frame = load_frame(args.frame, config.height, config.width)
     frame_tensor = frame_to_tensor(frame, device).to(dtype=next(model.parameters()).dtype)
-    token_history = encode_frame(model, frame_tensor, device, args.amp).unsqueeze(1)
-    actions = []
+    cls_state = encode_frame(model, frame_tensor, device, args.amp)
+    cls_history = cls_state.unsqueeze(1)
+    actions: list[list[float]] = []
 
     rl.init_window(config.width * args.scale, config.height * args.scale, "miniworld")
     rl.set_target_fps(60)
@@ -257,11 +260,10 @@ def run(args: argparse.Namespace) -> None:
             now = rl.get_time()
             if now - last_step_time >= frame_interval:
                 actions.append(action)
-                next_frame, token_history, actions = predict_next_frame(
-                    model, token_history, actions, args.context_len, device, args.amp,
+                next_frame_tensor, cls_history, actions = predict_next_frame(
+                    model, cls_history, actions, args.context_len, device, args.amp,
                 )
-                frame_tensor = next_frame.to(dtype=next(model.parameters()).dtype)
-                frame = tensor_to_frame(next_frame)
+                frame = tensor_to_frame(next_frame_tensor)
                 texture = replace_texture(texture, frame)
                 generated_count += 1
                 last_step_time = now

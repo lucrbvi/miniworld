@@ -59,7 +59,10 @@ class ActionPolicy(nn.Module):
     def __init__(self, dim: int, action_dim: int = 9, n_heads: int = 4, n_blocks: int = 2, ffn_mult: int = 3, dropout: float = 0.1, max_seq_len: int = 64):
         super().__init__()
         self.max_seq_len = max_seq_len
+        self.action_dim = action_dim
         self.time_pos = nn.Parameter(torch.randn(1, max_seq_len, dim) * 0.02)
+        self.action_embed = nn.Linear(action_dim, dim, bias=False)
+        nn.init.normal_(self.action_embed.weight, std=0.02)
         self.blocks = TransformerStack(dim, n_heads, n_blocks, ffn_mult, dropout, causal=True)
         self.head = nn.Sequential(
             nn.LayerNorm(dim),
@@ -67,13 +70,22 @@ class ActionPolicy(nn.Module):
             nn.Linear(dim, action_dim),
         )
 
-    def forward(self, states: Tensor) -> Tensor:
+    def forward(self, states: Tensor, past_actions: Tensor | None = None) -> Tensor:
         if states.dim() == 2:
             states = states.unsqueeze(1)
         t = states.size(1)
         if t > self.time_pos.size(1):
             raise ValueError(f"ActionPolicy got sequence length {t} > max_seq_len {self.time_pos.size(1)}")
-        return self.head(self.blocks(states + self.time_pos[:, :t]))
+
+        x = states
+        if past_actions is not None and past_actions.numel() > 0:
+            a_emb = self.action_embed(past_actions.to(dtype=states.dtype))
+            n = min(a_emb.size(1), t - 1)
+            if n > 0:
+                x = x.clone()
+                x[:, 1:1 + n] = x[:, 1:1 + n] + a_emb[:, :n]
+
+        return self.head(self.blocks(x + self.time_pos[:, :t]))
 
 class ViTEncoder(nn.Module):
     def __init__(self, config: "WorldModelConfig"):
@@ -145,19 +157,6 @@ class Predictor(nn.Module):
             x = block(x, cond, attn_mask=attn_mask)
         return self.projector(self.norm(x))
 
-
-
-class TokenTransition(nn.Module):
-    def __init__(self, dim: int, n_heads: int, n_blocks: int = 2, ffn_mult: int = 3, dropout: float = 0.0):
-        super().__init__()
-        self.blocks = TransformerStack(dim, n_heads, n_blocks, ffn_mult, dropout)
-
-    def forward(self, tokens: Tensor) -> Tensor:
-        lead = tokens.shape[:-2]
-        n, d = tokens.shape[-2:]
-        out = self.blocks(tokens.reshape(-1, n, d))
-        return out.reshape(*lead, n, d)
-
 class Decoder(nn.Module):
     def __init__(self, config: "WorldModelConfig"):
         super().__init__()
@@ -167,25 +166,27 @@ class Decoder(nn.Module):
         self.grid_h = gh
         self.grid_w = gw
         self.n_patches = gh * gw
-        self.pos = nn.Parameter(torch.randn(1, self.n_patches + 1, config.dim) * 0.02)
-        self.blocks = TransformerStack(config.dim, config.n_heads, max(1, config.decoder_n_blocks), config.ffn_mult, config.dropout_proba)
         up_c = getattr(config, "decoder_up_width", 64)
-        self.to_grid = nn.Conv2d(config.dim, up_c, 1)
+        self._up_c = up_c
+
+        self.proj = nn.Sequential(
+            nn.LayerNorm(config.dim),
+            nn.Linear(config.dim, up_c * gh * gw),
+            nn.SiLU(),
+        )
         self.up = nn.Sequential(
             nn.Conv2d(up_c, up_c * 4, 3, padding=1), nn.PixelShuffle(2), nn.SiLU(),
             nn.Conv2d(up_c, up_c * 4, 3, padding=1), nn.PixelShuffle(2), nn.SiLU(),
-            nn.Conv2d(up_c, 3 * 25, 3, padding=1), nn.PixelShuffle(5),
+            nn.Conv2d(up_c, 3 * 25,   3, padding=1), nn.PixelShuffle(5),
         )
 
-    def forward(self, tokens: Tensor) -> Tensor:
-        if tokens.size(-2) != self.n_patches + 1:
-            raise ValueError(f"Decoder needs CLS + {self.n_patches} patches, got {tokens.size(-2)} tokens")
-        lead = tokens.shape[:-2]
-        n, d = tokens.shape[-2:]
-        tokens = tokens.reshape(-1, n, d)
-        x = self.blocks(tokens + self.pos.to(dtype=tokens.dtype))[:, 1:]
-        x = x.permute(0, 2, 1).reshape(-1, d, self.grid_h, self.grid_w)
-        out = torch.sigmoid(self.up(self.to_grid(x)))
+    def forward(self, cls: Tensor) -> Tensor:
+        if cls.dim() >= 2 and cls.shape[-2] == self.n_patches + 1:
+            cls = cls[..., 0, :]
+        lead = cls.shape[:-1]
+        flat = cls.reshape(-1, cls.shape[-1])
+        spatial = self.proj(flat).view(-1, self._up_c, self.grid_h, self.grid_w)
+        out = torch.sigmoid(self.up(spatial))
         return out.reshape(*lead, *out.shape[1:])
 
 class WorldModelConfig(PretrainedConfig):
@@ -193,10 +194,10 @@ class WorldModelConfig(PretrainedConfig):
 
     def __init__(
         self,
-        height: int = 240, width: int = 320, patch_size: int = 16, dim: int = 256, n_heads: int = 4,
+        height: int = 240, width: int = 320, patch_size: int = 16, dim: int = 384, n_heads: int = 6,
         n_blocks: int = 3, decoder_hidden_mult: int = 4, decoder_n_blocks: int = 4,
         decoder_noise_std: float = 0.05, decoder_pred_token_ratio: float = 0.98,
-        decoder_curriculum_end: float = 0.85, transition_n_blocks: int = 2, ffn_mult: int = 3,
+        decoder_curriculum_end: float = 0.85, ffn_mult: int = 3,
         dropout_proba: float = 0.1, causal: bool = True, action_dim: int = 9, max_seq_len: int = 64,
         **kwargs,
     ):
@@ -212,7 +213,6 @@ class WorldModelConfig(PretrainedConfig):
         self.decoder_noise_std = decoder_noise_std
         self.decoder_pred_token_ratio = decoder_pred_token_ratio
         self.decoder_curriculum_end = decoder_curriculum_end
-        self.transition_n_blocks = transition_n_blocks
         self.ffn_mult = ffn_mult
         self.dropout_proba = dropout_proba
         self.causal = causal
@@ -228,7 +228,6 @@ class WorldModel(PreTrainedModel):
         self.n_patches = (config.height // config.patch_size) * (config.width // config.patch_size)
         self.encoder = ViTEncoder(config)
         self.predictor = Predictor(config)
-        self.transition = TokenTransition(config.dim, config.n_heads, config.transition_n_blocks, config.ffn_mult, config.dropout_proba)
         self.decoder = Decoder(config)
         self._sync_max_seq_len()
 
@@ -254,6 +253,9 @@ class WorldModel(PreTrainedModel):
 
     def predict(self, states: Tensor, actions: Tensor) -> Tensor:
         return self.predictor(states, actions)
+
+    def decode(self, states: Tensor) -> Tensor:
+        return self.decoder(states)
 
     def forward(self, frames: Tensor, actions: Tensor):
         states = self.encode(frames)

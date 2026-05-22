@@ -7,6 +7,7 @@ import lejepa
 import lpips
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from datasets import Dataset as HFDataset, load_dataset
@@ -106,9 +107,10 @@ def scalar(value: torch.Tensor) -> float:
 class DecoderTrainer(SectionedWandbTrainer):
     wandb_section = "decoder"
 
-    def __init__(self, *args, lpips_weight: float = 0.2, **kwargs):
+    def __init__(self, *args, lpips_weight: float = 0.2, noise_std: float = 0.15, **kwargs):
         super().__init__(*args, **kwargs)
         self.lpips_weight = lpips_weight
+        self.noise_std = noise_std
         self.lpips_loss = lpips.LPIPS(net="alex").eval()
         for param in self.lpips_loss.parameters():
             param.requires_grad = False
@@ -122,12 +124,22 @@ class DecoderTrainer(SectionedWandbTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         dtype = next(model.parameters()).dtype
         frames = inputs["frames"].to(dtype=dtype) / 255.0
-        T = frames.size(1)
+        B, T, C, H, W = frames.shape
+
+        if self.model.training:
+            frames = F.interpolate(frames.flatten(0, 1), size=(H + 32, W + 48), mode="bilinear").view(B, T, C, H + 32, W + 48)
+            top = torch.randint(0, 33, (B,), device=frames.device)
+            left = torch.randint(0, 49, (B,), device=frames.device)
+            frames = torch.stack([frames[b, :, :, t:t + H, l:l + W] for b, (t, l) in enumerate(zip(top, left))])
 
         self.lpips_loss = self.lpips_loss.to(frames.device)
 
         with torch.no_grad():
             states = model.encode(frames)
+
+        if self.noise_std > 0:
+            noise = torch.randn_like(states) * self.noise_std
+            states = states + noise
 
         recon = model.decode(states).flatten(0, 1)
         targets = frames.flatten(0, 1)
@@ -135,6 +147,10 @@ class DecoderTrainer(SectionedWandbTrainer):
         l1_loss = F.l1_loss(recon.float(), targets.float())
         lpips_loss = self.lpips_loss(recon.float() * 2 - 1, targets.float() * 2 - 1).mean()
         loss = l1_loss + self.lpips_weight * lpips_loss
+
+        if self.model.training and self.noise_std > 0:
+            gen_loss = self._gan_loss(recon.float(), targets.float())
+            loss = loss + 0.1 * gen_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
             self.log({
@@ -144,6 +160,25 @@ class DecoderTrainer(SectionedWandbTrainer):
         if return_outputs:
             return loss, {"recon": recon.detach()}
         return loss
+
+    def _gan_loss(self, fake: torch.Tensor, real: torch.Tensor) -> torch.Tensor:
+        if not hasattr(self, "_disc"):
+            self._disc = nn.Sequential(
+                nn.Conv2d(3, 64, 4, 2, 1), nn.LeakyReLU(0.2),
+                nn.Conv2d(64, 128, 4, 2, 1), nn.BatchNorm2d(128), nn.LeakyReLU(0.2),
+                nn.Conv2d(128, 256, 4, 2, 1), nn.BatchNorm2d(256), nn.LeakyReLU(0.2),
+                nn.Conv2d(256, 1, 4, 1, 0),
+            ).to(fake.device)
+            self._disc_opt = torch.optim.Adam(self._disc.parameters(), lr=1e-4, betas=(0.5, 0.9))
+        fake_det = fake.detach()
+        real_pred = self._disc(real)
+        fake_pred_det = self._disc(fake_det)
+        disc_loss = F.relu(1.0 - real_pred).mean() + F.relu(1.0 + fake_pred_det).mean()
+        self._disc_opt.zero_grad()
+        disc_loss.backward()
+        self._disc_opt.step()
+        gen_loss = -self._disc(fake).mean()
+        return gen_loss
 
 class WMTrainer(SectionedWandbTrainer):
     wandb_section = "wm"
@@ -223,24 +258,30 @@ def resolve_checkpoint(resume_from: str | None, output_dir: str) -> str | None:
 
 ACTION_NAMES = ["FWD", "BCK", "LEFT", "RIGHT", "TURN_L", "TURN_R", "ATTACK", "USE", "SPEED"]
 
-def compute_action_pos_weight(hf_dataset: HFDataset, n_buttons: int = 9) -> torch.Tensor:
-    actions = np.asarray(hf_dataset.select_columns("action").with_format("numpy")[:]["action"], dtype=np.float32)
-    flat = actions.reshape(-1, n_buttons)
-    n_pos = flat.sum(axis=0).clip(min=1)
-    n_neg = (len(flat) - flat.sum(axis=0)).clip(min=1)
-    weights = np.sqrt(n_neg / n_pos)
-    print(f"pos_weight: {dict(zip(ACTION_NAMES, np.round(weights, 2).tolist()))}", flush=True)
-    return torch.from_numpy(weights.astype(np.float32))
+
+def binary_to_grouped(actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    move_target = torch.where(actions[..., 0] > 0.5, 0, torch.where(actions[..., 1] > 0.5, 1, 2))
+    strafe_target = torch.where(actions[..., 2] > 0.5, 0, torch.where(actions[..., 3] > 0.5, 1, 2))
+    turn_target = torch.where(actions[..., 4] > 0.5, 0, torch.where(actions[..., 5] > 0.5, 1, 2))
+    binary_targets = actions[..., 6:9]
+    return move_target, strafe_target, turn_target, binary_targets
+
+def compute_grouped_loss(logits: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    move_t, strafe_t, turn_t, bin_t = binary_to_grouped(actions)
+    loss_move = F.cross_entropy(logits[..., 0:3].flatten(0, -2), move_t.flatten())
+    loss_strafe = F.cross_entropy(logits[..., 3:6].flatten(0, -2), strafe_t.flatten())
+    loss_turn = F.cross_entropy(logits[..., 6:9].flatten(0, -2), turn_t.flatten())
+    loss_bin = F.binary_cross_entropy_with_logits(logits[..., 9:12].flatten(0, -2), bin_t.flatten())
+    return loss_move + loss_strafe + loss_turn + loss_bin
 
 class ActionPolicyTrainer(SectionedWandbTrainer):
     wandb_section = "action_policy"
 
-    def __init__(self, wm_model: WorldModel, *args, pos_weight: torch.Tensor | None = None, **kwargs):
+    def __init__(self, wm_model: WorldModel, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.wm_model = wm_model.eval()
         for p in self.wm_model.parameters():
             p.requires_grad = False
-        self.pos_weight = pos_weight
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
@@ -257,27 +298,52 @@ class ActionPolicyTrainer(SectionedWandbTrainer):
         with torch.no_grad():
             states = self.wm_model.encode(frames)
 
-        logits = model(states, past_actions=actions)
-        logits = logits[:, :-1]
+        if self._teacher_prob() < 1.0 and torch.rand(1).item() > self._teacher_prob():
+            with torch.no_grad():
+                logits_teacher = model(states, past_actions=actions)
+                pred_binary = ActionPolicy.logits_to_binary(logits_teacher.detach()).float()
+                past = pred_binary[:, :-1]
+        else:
+            past = actions
 
-        pos_weight = self.pos_weight.to(device=logits.device, dtype=logits.dtype) if self.pos_weight is not None else None
-        loss = F.binary_cross_entropy_with_logits(logits, actions, pos_weight=pos_weight)
+        if self._noise_prob() > 0:
+            noise = torch.rand_like(past) < self._noise_prob()
+            past = past.clone()
+            past[noise] = 1 - past[noise]
+
+        logits = model(states, past_actions=past)
+        logits = logits[:, :-1]
+        loss = compute_grouped_loss(logits, actions)
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
             with torch.no_grad():
-                preds = (torch.sigmoid(logits) > 0.5).float()
+                preds = ActionPolicy.logits_to_binary(logits.detach()).float()
                 acc = (preds == actions).float().mean()
-                pos_rate = preds.mean()
-                target_rate = actions.mean()
-                tp = (preds * actions).sum().clamp_min(1)
-                fp = (preds * (1 - actions)).sum()
-                fn = ((1 - preds) * actions).sum()
-                f1 = (2 * tp / (2 * tp + fp + fn)).item()
-            self.log({"loss": scalar(loss), "acc": scalar(acc), "f1": f1, "pred_pos_rate": scalar(pos_rate), "target_pos_rate": scalar(target_rate)})
+                f1_per_action = []
+                for j in range(9):
+                    tp = (preds[..., j] * actions[..., j]).sum().clamp_min(1)
+                    fp = (preds[..., j] * (1 - actions[..., j])).sum()
+                    fn = ((1 - preds[..., j]) * actions[..., j]).sum()
+                    f1_per_action.append((2 * tp / (2 * tp + fp + fn)).item())
+                f1 = sum(f1_per_action) / 9
+            self.log({"loss": scalar(loss), "acc": scalar(acc), "f1": f1,
+                      "teacher_prob": self._teacher_prob(), "noise_prob": self._noise_prob()})
 
         if return_outputs:
             return loss, {"logits": logits.detach()}
         return loss
+
+    def _teacher_prob(self) -> float:
+        if self.state.max_steps <= 1:
+            return 1.0
+        p = self.state.global_step / (self.state.max_steps - 1)
+        return max(0.2, 1.0 - p * 0.8)
+
+    def _noise_prob(self) -> float:
+        if self.state.max_steps <= 1:
+            return 0.0
+        p = self.state.global_step / (self.state.max_steps - 1)
+        return 0.05 * (1.0 - p)
 
 def train(
     config: WorldModelConfig,
@@ -285,11 +351,15 @@ def train(
     output_root: str = "./checkpoints",
     resume_from: str | None = "auto",
     wm_checkpoint: str | None = None,
-    context_len: int = 16,
+    context_len: int = 40,
     sequence_stride: int = 1,
     max_eval_sequences: int = 2048,
     dataloader_num_workers: int = 4,
     dataloader_prefetch_factor: int | None = 2,
+    wm_epochs: int = 3,
+    decoder_epochs: int = 5,
+    action_policy_epochs: int = 5,
+    decoder_noise_std: float = 0.15,
 ):
     if mode not in {"all", "wm", "decoder", "action_policy"}:
         raise ValueError("mode must be 'all', 'wm', 'decoder' or 'action_policy'")
@@ -322,7 +392,7 @@ def train(
 
     args = TrainingArguments(
         output_dir=wm_output_dir,
-        num_train_epochs=1,
+        num_train_epochs=wm_epochs,
         max_steps=-1,
         per_device_train_batch_size=60,
         per_device_eval_batch_size=60,
@@ -397,7 +467,7 @@ def train(
     if mode == "action_policy":
         ap_args = TrainingArguments(
             output_dir=action_policy_output_dir,
-            num_train_epochs=1,
+            num_train_epochs=action_policy_epochs,
             per_device_train_batch_size=args.per_device_train_batch_size,
             per_device_eval_batch_size=args.per_device_eval_batch_size,
             learning_rate=1e-4,
@@ -427,11 +497,9 @@ def train(
         )
         policy_params = sum(p.numel() for p in policy.parameters())
         print(f"ActionPolicy: {policy_params:,} params", flush=True)
-        pos_weight = compute_action_pos_weight(split["train"])
         ap_trainer = ActionPolicyTrainer(
             wm_model=model, model=policy, args=ap_args,
             train_dataset=train_dataset, eval_dataset=eval_dataset,
-            pos_weight=pos_weight,
         )
         start_wandb_run("action-policy", config=config.to_dict())
         ap_trainer.train()
@@ -452,7 +520,7 @@ def train(
 
     decoder_args = TrainingArguments(
         output_dir=decoder_output_dir,
-        num_train_epochs=1,
+        num_train_epochs=decoder_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size * 2,
         per_device_eval_batch_size=args.per_device_eval_batch_size * 2,
         learning_rate=1e-4,
@@ -476,7 +544,7 @@ def train(
     decoder_checkpoint = resolve_checkpoint(resume_from, decoder_args.output_dir)
     if decoder_checkpoint is not None:
         print(f"Resume decoder: {decoder_checkpoint}", flush=True)
-    trainer = DecoderTrainer(model=model, args=decoder_args, train_dataset=train_dataset, eval_dataset=eval_dataset)
+    trainer = DecoderTrainer(model=model, args=decoder_args, train_dataset=train_dataset, eval_dataset=eval_dataset, noise_std=decoder_noise_std)
     start_wandb_run("decoder-probe", config=config.to_dict())
     trainer.train(resume_from_checkpoint=decoder_checkpoint)
     if hasattr(trainer.model.decoder, "_orig_mod"):
@@ -488,7 +556,7 @@ def train(
         return
     ap_args = TrainingArguments(
         output_dir=action_policy_output_dir,
-        num_train_epochs=1,
+        num_train_epochs=action_policy_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         learning_rate=1e-4,
@@ -525,11 +593,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default=os.environ.get("MINIWORLD_CHECKPOINT_DIR", "./checkpoints"))
     parser.add_argument("--resume-from", default="auto", help="auto, none, or a checkpoint directory")
     parser.add_argument("--wm-checkpoint", default=None, help="Pretrained WM checkpoint for --mode decoder or action_policy")
-    parser.add_argument("--context-len", type=int, default=10)
+    parser.add_argument("--context-len", type=int, default=40)
     parser.add_argument("--sequence-stride", type=int, default=1)
     parser.add_argument("--max-eval-sequences", type=int, default=512)
     parser.add_argument("--dataloader-num-workers", type=int, default=4)
     parser.add_argument("--dataloader-prefetch-factor", type=int, default=2)
+    parser.add_argument("--wm-epochs", type=int, default=3)
+    parser.add_argument("--decoder-epochs", type=int, default=5)
+    parser.add_argument("--action-policy-epochs", type=int, default=5)
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -547,4 +618,7 @@ if __name__ == "__main__":
         config=WorldModelConfig(
             height=240, width=320, patch_size=20, dim=408, n_heads=6,
         ),
+        wm_epochs=cli.wm_epochs,
+        decoder_epochs=cli.decoder_epochs,
+        action_policy_epochs=cli.action_policy_epochs,
     )

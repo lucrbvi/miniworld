@@ -75,6 +75,7 @@ def run(args: argparse.Namespace) -> None:
 
     video = None
     history: torch.Tensor | None = None
+    past_actions: torch.Tensor | None = None
     max_ctx = ap.max_seq_len
     try:
         game.new_episode()
@@ -92,8 +93,14 @@ def run(args: argparse.Namespace) -> None:
             cls_token = encode_frame(model, frame, device, dtype)
             history = cls_token.unsqueeze(1) if history is None else torch.cat([history, cls_token.unsqueeze(1)], dim=1)[:, -max_ctx:]
 
-            logits = ap(history)[:, -1]
-            action = (torch.sigmoid(logits) > args.threshold).int()[0].cpu().tolist()
+            logits = ap(history, past_actions=past_actions)[:, -1]
+            action = ActionPolicy.logits_to_binary(logits / args.temperature)[0].cpu().tolist()
+            if args.epsilon > 0 and torch.rand(1).item() < args.epsilon:
+                action = [0.0] * 9
+                action[torch.randint(0, 9, (1,)).item()] = 1.0
+
+            action_t = torch.tensor([action], device=device, dtype=dtype).unsqueeze(0)
+            past_actions = action_t if past_actions is None else torch.cat([past_actions, action_t], dim=1)[:, -(max_ctx - 1):]
 
             active = [name for name, val in zip(ACTION_NAMES, action) if val]
             overlay = f"step={step} action={' '.join(active) if active else 'none'}"
@@ -131,8 +138,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--map", default="E1M1")
     parser.add_argument("--skill", type=int, default=1)
     parser.add_argument("--scale", type=int, default=2)
-    parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--frame-skip", type=int, default=4)
+    parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sigmoid/softmax (lower = more deterministic)")
+    parser.add_argument("--epsilon", type=float, default=0.05, help="Random action probability to break loops")
+    parser.add_argument("--frame-skip", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--record", default=None)

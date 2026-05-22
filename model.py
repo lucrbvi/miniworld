@@ -64,10 +64,11 @@ class ActionPolicy(nn.Module):
         self.action_embed = nn.Linear(action_dim, dim, bias=False)
         nn.init.normal_(self.action_embed.weight, std=0.02)
         self.blocks = TransformerStack(dim, n_heads, n_blocks, ffn_mult, dropout, causal=True)
+        head_dim = 3 + 3 + 3 + 3  # move(3) + strafe(3) + turn(3) + binary(3)
         self.head = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, dim), nn.SiLU(),
-            nn.Linear(dim, action_dim),
+            nn.Linear(dim, head_dim),
         )
 
     def forward(self, states: Tensor, past_actions: Tensor | None = None) -> Tensor:
@@ -86,6 +87,26 @@ class ActionPolicy(nn.Module):
                 x[:, 1:1 + n] = x[:, 1:1 + n] + a_emb[:, :n]
 
         return self.head(self.blocks(x + self.time_pos[:, :t]))
+
+    @staticmethod
+    def logits_to_binary(logits: Tensor) -> Tensor:
+        move = logits[..., 0:3].argmax(dim=-1)
+        strafe = logits[..., 3:6].argmax(dim=-1)
+        turn = logits[..., 6:9].argmax(dim=-1)
+        attack = (torch.sigmoid(logits[..., 9]) > 0.5).long()
+        use = (torch.sigmoid(logits[..., 10]) > 0.5).long()
+        speed = (torch.sigmoid(logits[..., 11]) > 0.5).long()
+        actions = torch.zeros(*logits.shape[:-1], 9, device=logits.device, dtype=torch.long)
+        actions[..., 0] = (move == 0).long()
+        actions[..., 1] = (move == 1).long()
+        actions[..., 2] = (strafe == 0).long()
+        actions[..., 3] = (strafe == 1).long()
+        actions[..., 4] = (turn == 0).long()
+        actions[..., 5] = (turn == 1).long()
+        actions[..., 6] = attack
+        actions[..., 7] = use
+        actions[..., 8] = speed
+        return actions
 
 class ViTEncoder(nn.Module):
     def __init__(self, config: "WorldModelConfig"):

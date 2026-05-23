@@ -21,9 +21,6 @@ except ImportError:
             return fn
     HAS_ZERO_GPU = False
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 MODEL_REPO = "lucrbrtv/doom-worldmodel"
 MAX_CONTEXT = 8
 HEIGHT, WIDTH = 240, 320
@@ -42,11 +39,7 @@ ACTIONS: dict[str, list[float]] = {
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ---------------------------------------------------------------------------
-# Model — loaded once, lives on CPU between ZeroGPU calls
-# ---------------------------------------------------------------------------
 _model: WorldModel | None = None
-
 
 def get_model() -> WorldModel:
     global _model
@@ -56,11 +49,6 @@ def get_model() -> WorldModel:
             _model = _model.to(DEVICE)
     return _model
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _frame_to_tensor(frame: np.ndarray) -> torch.Tensor:
     chw = np.ascontiguousarray(np.transpose(frame.astype(np.float32), (2, 0, 1)))
     return torch.from_numpy(chw).to(device=DEVICE, dtype=torch.float16) / 255.0
@@ -69,11 +57,6 @@ def _frame_to_tensor(frame: np.ndarray) -> torch.Tensor:
 def _tensor_to_pil(t: torch.Tensor) -> Image.Image:
     arr = t.mul(255).clamp(0, 255).byte().cpu().numpy()
     return Image.fromarray(np.transpose(arr, (1, 2, 0)))
-
-
-# ---------------------------------------------------------------------------
-# Inference functions
-# ---------------------------------------------------------------------------
 
 @spaces.GPU
 def initialize(init_image: np.ndarray | None):
@@ -89,7 +72,6 @@ def initialize(init_image: np.ndarray | None):
         states = m.encode(ft.unsqueeze(0).unsqueeze(0))
 
     return pil, states.cpu(), [], 0, "Steps: 0"
-
 
 @spaces.GPU
 def step(action_name: str, cls_history, actions_list: list, step_count: int):
@@ -118,10 +100,6 @@ def step(action_name: str, cls_history, actions_list: list, step_count: int):
 
     return _tensor_to_pil(frame), cls_history.cpu(), actions_list, step_count + 1, f"Steps: {step_count + 1}"
 
-
-# ---------------------------------------------------------------------------
-# Keyboard JS — maps WASD / arrows / space to action buttons
-# ---------------------------------------------------------------------------
 _JS = """
 () => {
     const KEY_MAP = {
@@ -145,9 +123,6 @@ _JS = """
 }
 """
 
-# ---------------------------------------------------------------------------
-# UI
-# ---------------------------------------------------------------------------
 CSS = """
 #frame-display { border-radius: 8px; overflow: hidden; }
 .action-btn button { font-size: 15px; padding: 10px 0; width: 100%; }

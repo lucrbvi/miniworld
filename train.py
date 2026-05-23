@@ -148,14 +148,16 @@ class DecoderTrainer(SectionedWandbTrainer):
         lpips_loss = self.lpips_loss(recon.float() * 2 - 1, targets.float() * 2 - 1).mean()
         loss = l1_loss + self.lpips_weight * lpips_loss
 
+        gen_loss = None
         if self.model.training and self.noise_std > 0:
             gen_loss = self._gan_loss(recon.float(), targets.float())
             loss = loss + 0.1 * gen_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
-            self.log({
-                "loss": scalar(loss), "l1": scalar(l1_loss), "lpips": scalar(lpips_loss),
-            })
+            log_dict = {"loss": scalar(loss), "l1": scalar(l1_loss), "lpips": scalar(lpips_loss)}
+            if gen_loss is not None:
+                log_dict["gan"] = scalar(gen_loss)
+            self.log(log_dict)
 
         if return_outputs:
             return loss, {"recon": recon.detach()}

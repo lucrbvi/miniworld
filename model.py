@@ -187,10 +187,14 @@ class Decoder(nn.Module):
         self.grid_h = gh
         self.grid_w = gw
         self.n_patches = gh * gw
-        up_c = getattr(config, "decoder_up_width", 64)
-        self._up_c = up_c
 
-        self.attn_block = AdaLNBlock(config.dim, config.n_heads, config.ffn_mult, config.dropout_proba)
+        self._up_c = config.decoder_up_width
+        up_c = self._up_c
+
+        self.attn_blocks = nn.ModuleList([
+            AdaLNBlock(config.dim, config.n_heads, config.ffn_mult, config.dropout_proba)
+            for _ in range(config.decoder_n_attn_blocks)
+        ])
         self.proj = nn.Sequential(
             nn.LayerNorm(config.dim),
             nn.Linear(config.dim, up_c),
@@ -199,20 +203,21 @@ class Decoder(nn.Module):
         self.up = nn.Sequential(
             nn.Conv2d(up_c, up_c * 4, 3, padding=1), nn.PixelShuffle(2), nn.SiLU(),
             nn.Conv2d(up_c, up_c * 4, 3, padding=1), nn.PixelShuffle(2), nn.SiLU(),
-            nn.Conv2d(up_c, 3 * 25,   3, padding=1), nn.PixelShuffle(5),
+            nn.Conv2d(up_c, up_c * 4, 3, padding=1), nn.PixelShuffle(2), nn.SiLU(),
+            nn.Conv2d(up_c, 3 * 4,    3, padding=1), nn.PixelShuffle(2),
         )
 
     def forward(self, cls_next: Tensor, patches_prev: Tensor) -> Tensor:
-        lead = cls_next.shape[:-1]
         cls_flat = cls_next.reshape(-1, cls_next.shape[-1])
         patches_flat = patches_prev.reshape(-1, self.n_patches, patches_prev.shape[-1])
         B = cls_flat.shape[0]
 
         cond = cls_flat.unsqueeze(1).expand(-1, self.n_patches, -1)
-        x = self.attn_block(patches_flat, cond)
+        x = patches_flat
+        for block in self.attn_blocks:
+            x = block(x, cond)
         spatial = self.proj(x).transpose(1, 2).reshape(B, self._up_c, self.grid_h, self.grid_w)
-        out = torch.sigmoid(self.up(spatial))
-        return out.reshape(*lead, *out.shape[1:])
+        return torch.sigmoid(self.up(spatial))
 
 class WorldModelConfig(PretrainedConfig):
     model_type = "world_model"
@@ -223,6 +228,7 @@ class WorldModelConfig(PretrainedConfig):
         n_blocks: int = 3, decoder_hidden_mult: int = 4, decoder_n_blocks: int = 4,
         decoder_noise_std: float = 0.05, decoder_pred_token_ratio: float = 0.98,
         decoder_curriculum_end: float = 0.85, ffn_mult: int = 3,
+        decoder_up_width: int = 128, decoder_n_attn_blocks: int = 1,
         dropout_proba: float = 0.1, causal: bool = True, action_dim: int = 9, max_seq_len: int = 64,
         **kwargs,
     ):
@@ -239,6 +245,8 @@ class WorldModelConfig(PretrainedConfig):
         self.decoder_pred_token_ratio = decoder_pred_token_ratio
         self.decoder_curriculum_end = decoder_curriculum_end
         self.ffn_mult = ffn_mult
+        self.decoder_up_width = decoder_up_width
+        self.decoder_n_attn_blocks = decoder_n_attn_blocks
         self.dropout_proba = dropout_proba
         self.causal = causal
         self.action_dim = action_dim

@@ -104,13 +104,28 @@ class SectionedWandbTrainer(Trainer):
 def scalar(value: torch.Tensor) -> float:
     return value.detach().float().cpu().item()
 
+class PatchDiscriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 64, 4, 2, 1), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, 4, 2, 1), nn.InstanceNorm2d(128), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 256, 4, 2, 1), nn.InstanceNorm2d(256), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(256, 512, 4, 1, 1), nn.InstanceNorm2d(512), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(512, 1, 4, 1, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
 class DecoderTrainer(SectionedWandbTrainer):
     wandb_section = "decoder"
 
-    def __init__(self, *args, lpips_weight: float = 0.2, noise_std: float = 0.15, **kwargs):
+    def __init__(self, *args, lpips_weight: float = 0.2, noise_std: float = 0.15, resume_disc_dir: str | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.lpips_weight = lpips_weight
         self.noise_std = noise_std
+        self._disc_resume_dir = resume_disc_dir
         self.lpips_loss = lpips.LPIPS(net="alex").eval()
         for param in self.lpips_loss.parameters():
             param.requires_grad = False
@@ -140,8 +155,9 @@ class DecoderTrainer(SectionedWandbTrainer):
         patches_prev = tokens[:, :-1, 1:].detach()
         cls_next = states[:, 1:]
 
-        if self.noise_std > 0:
+        if self.model.training and self.noise_std > 0:
             cls_next = cls_next + torch.randn_like(cls_next) * self.noise_std
+            patches_prev = patches_prev + torch.randn_like(patches_prev) * self.noise_std
 
         cls_next_flat = cls_next.flatten(0, 1)
         patches_prev_flat = patches_prev.flatten(0, 1)
@@ -169,15 +185,20 @@ class DecoderTrainer(SectionedWandbTrainer):
             return loss, {"recon": recon.detach()}
         return loss
 
+    def _save_checkpoint(self, model, trial, metrics=None):
+        super()._save_checkpoint(model, trial, metrics=metrics)
+        if hasattr(self, "_disc"):
+            ckpt = os.path.join(self.args.output_dir, f"checkpoint-{self.state.global_step}")
+            torch.save(self._disc.state_dict(), os.path.join(ckpt, "discriminator.pt"))
+
     def _gan_loss(self, fake: torch.Tensor, real: torch.Tensor, r1_gamma: float = 10.0, r1_batch: int = 40) -> tuple[torch.Tensor, torch.Tensor]:
         if not hasattr(self, "_disc"):
-            self._disc = nn.Sequential(
-                nn.Conv2d(3, 64, 4, 2, 1), nn.LeakyReLU(0.2),
-                nn.Conv2d(64, 128, 4, 2, 1), nn.InstanceNorm2d(128), nn.LeakyReLU(0.2),
-                nn.Conv2d(128, 256, 4, 2, 1), nn.InstanceNorm2d(256), nn.LeakyReLU(0.2),
-                nn.Conv2d(256, 1, 4, 1, 0),
-            ).to(fake.device)
+            self._disc = PatchDiscriminator().to(fake.device)
             self._disc_opt = torch.optim.Adam(self._disc.parameters(), lr=1e-4, betas=(0.5, 0.9))
+            if self._disc_resume_dir is not None:
+                disc_path = os.path.join(self._disc_resume_dir, "discriminator.pt")
+                if os.path.exists(disc_path):
+                    self._disc.load_state_dict(torch.load(disc_path, map_location=fake.device, weights_only=True))
 
         fake_det = fake.detach()
         real_pred = self._disc(real)
@@ -639,7 +660,7 @@ def train(
     decoder_checkpoint = resolve_checkpoint(resume_from, decoder_args.output_dir)
     if decoder_checkpoint is not None:
         print(f"Resume decoder: {decoder_checkpoint}", flush=True)
-    trainer = DecoderTrainer(model=model, args=decoder_args, train_dataset=train_dataset, eval_dataset=eval_dataset, noise_std=decoder_noise_std)
+    trainer = DecoderTrainer(model=model, args=decoder_args, train_dataset=train_dataset, eval_dataset=eval_dataset, noise_std=decoder_noise_std, resume_disc_dir=decoder_checkpoint)
     start_wandb_run("decoder-probe", config=config.to_dict())
     trainer.train(resume_from_checkpoint=decoder_checkpoint)
     if hasattr(trainer.model.decoder, "_orig_mod"):
@@ -715,7 +736,8 @@ if __name__ == "__main__":
         dataloader_num_workers=cli.dataloader_num_workers,
         dataloader_prefetch_factor=cli.dataloader_prefetch_factor,
         config=WorldModelConfig(
-            height=240, width=320, patch_size=20, dim=408, n_heads=6,
+            height=240, width=320, patch_size=16, dim=384, n_heads=6,
+            decoder_up_width=128, decoder_n_attn_blocks=2,
         ),
         wm_epochs=cli.wm_epochs,
         decoder_epochs=cli.decoder_epochs,

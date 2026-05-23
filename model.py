@@ -190,9 +190,10 @@ class Decoder(nn.Module):
         up_c = getattr(config, "decoder_up_width", 64)
         self._up_c = up_c
 
+        self.attn_block = AdaLNBlock(config.dim, config.n_heads, config.ffn_mult, config.dropout_proba)
         self.proj = nn.Sequential(
             nn.LayerNorm(config.dim),
-            nn.Linear(config.dim, up_c * gh * gw),
+            nn.Linear(config.dim, up_c),
             nn.SiLU(),
         )
         self.up = nn.Sequential(
@@ -201,12 +202,15 @@ class Decoder(nn.Module):
             nn.Conv2d(up_c, 3 * 25,   3, padding=1), nn.PixelShuffle(5),
         )
 
-    def forward(self, cls: Tensor) -> Tensor:
-        if cls.dim() >= 2 and cls.shape[-2] == self.n_patches + 1:
-            cls = cls[..., 0, :]
-        lead = cls.shape[:-1]
-        flat = cls.reshape(-1, cls.shape[-1])
-        spatial = self.proj(flat).view(-1, self._up_c, self.grid_h, self.grid_w)
+    def forward(self, cls_next: Tensor, patches_prev: Tensor) -> Tensor:
+        lead = cls_next.shape[:-1]
+        cls_flat = cls_next.reshape(-1, cls_next.shape[-1])
+        patches_flat = patches_prev.reshape(-1, self.n_patches, patches_prev.shape[-1])
+        B = cls_flat.shape[0]
+
+        cond = cls_flat.unsqueeze(1).expand(-1, self.n_patches, -1)
+        x = self.attn_block(patches_flat, cond)
+        spatial = self.proj(x).transpose(1, 2).reshape(B, self._up_c, self.grid_h, self.grid_w)
         out = torch.sigmoid(self.up(spatial))
         return out.reshape(*lead, *out.shape[1:])
 
@@ -275,8 +279,8 @@ class WorldModel(PreTrainedModel):
     def predict(self, states: Tensor, actions: Tensor) -> Tensor:
         return self.predictor(states, actions)
 
-    def decode(self, states: Tensor) -> Tensor:
-        return self.decoder(states)
+    def decode(self, cls_next: Tensor, patches_prev: Tensor) -> Tensor:
+        return self.decoder(cls_next, patches_prev)
 
     def forward(self, frames: Tensor, actions: Tensor):
         states = self.encode(frames)

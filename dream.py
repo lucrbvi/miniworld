@@ -185,20 +185,21 @@ def autocast_context(device: str, enabled: bool, is_half: bool = False):
     return nullcontext()
 
 @torch.inference_mode()
-def encode_frame(model: WorldModel, frame: torch.Tensor, device: str, amp: bool) -> torch.Tensor:
+def encode_frame(model: WorldModel, frame: torch.Tensor, device: str, amp: bool) -> tuple[torch.Tensor, torch.Tensor]:
     with autocast_context(device, amp, frame.dtype == torch.float16):
-        states = model.encode(frame.unsqueeze(0).unsqueeze(0))
-    return states[:, 0]
+        states, tokens = model.encode(frame.unsqueeze(0).unsqueeze(0), return_tokens=True)
+    return states[:, 0], tokens[:, 0, 1:]  # cls [1, dim], patches [1, N, dim]
 
 @torch.inference_mode()
 def predict_next_frame(
     model: WorldModel,
     cls_history: torch.Tensor,
+    patches_prev: torch.Tensor,
     actions: list[list[float]] | torch.Tensor,
     max_context_len: int,
     device: str,
     amp: bool,
-) -> tuple[torch.Tensor, torch.Tensor, list]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list]:
     if isinstance(actions, list):
         n = cls_history.size(1)
         action_tensor = torch.tensor(actions[-n:], device=device, dtype=cls_history.dtype).unsqueeze(0)
@@ -207,7 +208,9 @@ def predict_next_frame(
 
     with autocast_context(device, amp, cls_history.dtype == torch.float16):
         pred_cls = model.predict(cls_history, action_tensor)[:, -1]
-        pixel_pred = model.decode(pred_cls)[0]
+        pixel_pred = model.decode(pred_cls, patches_prev)[0]
+        _, next_tokens = model.encode(pixel_pred.unsqueeze(0).unsqueeze(0), return_tokens=True)
+    next_patches = next_tokens[:, 0, 1:]
 
     pred_cls_t = pred_cls.unsqueeze(1)
     if cls_history.size(1) < max_context_len:
@@ -217,7 +220,7 @@ def predict_next_frame(
         if isinstance(actions, list):
             actions = actions[-(max_context_len - 1):]
 
-    return pixel_pred, new_cls_history, actions
+    return pixel_pred, new_cls_history, next_patches, actions
 
 
 def draw_ui(action: list[float], fps: float, generated_count: int) -> None:
@@ -242,7 +245,7 @@ def run(args: argparse.Namespace) -> None:
     config = model.config
     frame = load_frame(args.frame, config.height, config.width)
     frame_tensor = frame_to_tensor(frame, device).to(dtype=next(model.parameters()).dtype)
-    cls_state = encode_frame(model, frame_tensor, device, args.amp)
+    cls_state, patches = encode_frame(model, frame_tensor, device, args.amp)
     cls_history = cls_state.unsqueeze(1)
     actions: list[list[float]] = []
 
@@ -260,8 +263,8 @@ def run(args: argparse.Namespace) -> None:
             now = rl.get_time()
             if now - last_step_time >= frame_interval:
                 actions.append(action)
-                next_frame_tensor, cls_history, actions = predict_next_frame(
-                    model, cls_history, actions, args.context_len, device, args.amp,
+                next_frame_tensor, cls_history, patches, actions = predict_next_frame(
+                    model, cls_history, patches, actions, args.context_len, device, args.amp,
                 )
                 frame = tensor_to_frame(next_frame_tensor)
                 texture = replace_texture(texture, frame)

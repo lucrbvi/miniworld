@@ -135,14 +135,19 @@ class DecoderTrainer(SectionedWandbTrainer):
         self.lpips_loss = self.lpips_loss.to(frames.device)
 
         with torch.no_grad():
-            states = model.encode(frames)
+            states, tokens = model.encode(frames, return_tokens=True)
+
+        patches_prev = tokens[:, :-1, 1:].detach()
+        cls_next = states[:, 1:]
 
         if self.noise_std > 0:
-            noise = torch.randn_like(states) * self.noise_std
-            states = states + noise
+            cls_next = cls_next + torch.randn_like(cls_next) * self.noise_std
 
-        recon = model.decode(states).flatten(0, 1)
-        targets = frames.flatten(0, 1)
+        cls_next_flat = cls_next.flatten(0, 1)
+        patches_prev_flat = patches_prev.flatten(0, 1)
+        targets = frames[:, 1:].flatten(0, 1)
+
+        recon = model.decode(cls_next_flat, patches_prev_flat)
 
         l1_loss = F.l1_loss(recon.float(), targets.float())
         lpips_loss = self.lpips_loss(recon.float() * 2 - 1, targets.float() * 2 - 1).mean()
@@ -691,7 +696,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wm-epochs", type=int, default=3)
     parser.add_argument("--decoder-epochs", type=int, default=5)
     parser.add_argument("--action-policy-epochs", type=int, default=5)
-    parser.add_argument("--rollout-steps", type=int, default=3, help="Max rollout depth for WM training (curriculum grows 1→k over first 50%% of training)")
+    parser.add_argument("--rollout-steps", type=int, default=3, help="Max rollout depth for WM training (curriculum grows 1->k over first 50%% of training)")
     parser.add_argument("--rollout-weight", type=float, default=1.0, help="Weight of the rollout loss")
     parser.add_argument("--predictor-noise-std", type=float, default=0.05, help="Gaussian noise std on predictor input states during WM training")
     parser.add_argument("--variance-penalty-weight", type=float, default=0.1, help="Weight of the pred_std < target_std penalty")

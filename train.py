@@ -150,37 +150,51 @@ class DecoderTrainer(SectionedWandbTrainer):
 
         gen_loss = None
         if self.model.training and self.noise_std > 0:
-            gen_loss = self._gan_loss(recon.float(), targets.float())
+            gen_loss, disc_loss = self._gan_loss(recon.float(), targets.float())
             loss = loss + 0.1 * gen_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
             log_dict = {"loss": scalar(loss), "l1": scalar(l1_loss), "lpips": scalar(lpips_loss)}
             if gen_loss is not None:
                 log_dict["gan"] = scalar(gen_loss)
+                log_dict["discriminator_loss"] = scalar(disc_loss)
             self.log(log_dict)
 
         if return_outputs:
             return loss, {"recon": recon.detach()}
         return loss
 
-    def _gan_loss(self, fake: torch.Tensor, real: torch.Tensor) -> torch.Tensor:
+    def _gan_loss(self, fake: torch.Tensor, real: torch.Tensor, r1_gamma: float = 10.0) -> tuple[torch.Tensor, torch.Tensor]:
         if not hasattr(self, "_disc"):
             self._disc = nn.Sequential(
                 nn.Conv2d(3, 64, 4, 2, 1), nn.LeakyReLU(0.2),
-                nn.Conv2d(64, 128, 4, 2, 1), nn.BatchNorm2d(128), nn.LeakyReLU(0.2),
-                nn.Conv2d(128, 256, 4, 2, 1), nn.BatchNorm2d(256), nn.LeakyReLU(0.2),
+                nn.Conv2d(64, 128, 4, 2, 1), nn.InstanceNorm2d(128), nn.LeakyReLU(0.2),
+                nn.Conv2d(128, 256, 4, 2, 1), nn.InstanceNorm2d(256), nn.LeakyReLU(0.2),
                 nn.Conv2d(256, 1, 4, 1, 0),
             ).to(fake.device)
             self._disc_opt = torch.optim.Adam(self._disc.parameters(), lr=1e-4, betas=(0.5, 0.9))
+
         fake_det = fake.detach()
+        real.requires_grad_(True)
         real_pred = self._disc(real)
         fake_pred_det = self._disc(fake_det)
         disc_loss = F.relu(1.0 - real_pred).mean() + F.relu(1.0 + fake_pred_det).mean()
+
+        # R1 penalty: penalize gradient norm of D on real data
+        r1_penalty = torch.tensor(0.0, device=fake.device)
+        if r1_gamma > 0:
+            grad_real, = torch.autograd.grad(
+                outputs=real_pred.sum(), inputs=real, create_graph=True, only_inputs=True,
+            )
+            r1_penalty = 0.5 * r1_gamma * grad_real.pow(2).mean()
+
         self._disc_opt.zero_grad()
-        disc_loss.backward()
+        (disc_loss + r1_penalty).backward()
         self._disc_opt.step()
+        real.requires_grad_(False)
+
         gen_loss = -self._disc(fake).mean()
-        return gen_loss
+        return gen_loss, disc_loss.detach()
 
 class WMTrainer(SectionedWandbTrainer):
     wandb_section = "wm"

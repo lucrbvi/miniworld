@@ -164,7 +164,7 @@ class DecoderTrainer(SectionedWandbTrainer):
             return loss, {"recon": recon.detach()}
         return loss
 
-    def _gan_loss(self, fake: torch.Tensor, real: torch.Tensor, r1_gamma: float = 10.0) -> tuple[torch.Tensor, torch.Tensor]:
+    def _gan_loss(self, fake: torch.Tensor, real: torch.Tensor, r1_gamma: float = 10.0, r1_batch: int = 40) -> tuple[torch.Tensor, torch.Tensor]:
         if not hasattr(self, "_disc"):
             self._disc = nn.Sequential(
                 nn.Conv2d(3, 64, 4, 2, 1), nn.LeakyReLU(0.2),
@@ -175,23 +175,24 @@ class DecoderTrainer(SectionedWandbTrainer):
             self._disc_opt = torch.optim.Adam(self._disc.parameters(), lr=1e-4, betas=(0.5, 0.9))
 
         fake_det = fake.detach()
-        real.requires_grad_(True)
         real_pred = self._disc(real)
         fake_pred_det = self._disc(fake_det)
         disc_loss = F.relu(1.0 - real_pred).mean() + F.relu(1.0 + fake_pred_det).mean()
 
-        # R1 penalty: penalize gradient norm of D on real data
         r1_penalty = torch.tensor(0.0, device=fake.device)
         if r1_gamma > 0:
+            n = min(real.size(0), r1_batch)
+            idx = torch.randperm(real.size(0), device=real.device)[:n]
+            real_sub = real[idx].detach().requires_grad_(True)
+            real_pred_sub = self._disc(real_sub)
             grad_real, = torch.autograd.grad(
-                outputs=real_pred.sum(), inputs=real, create_graph=True, only_inputs=True,
+                outputs=real_pred_sub.sum(), inputs=real_sub, create_graph=True, only_inputs=True,
             )
             r1_penalty = 0.5 * r1_gamma * grad_real.pow(2).mean()
 
         self._disc_opt.zero_grad()
         (disc_loss + r1_penalty).backward()
         self._disc_opt.step()
-        real.requires_grad_(False)
 
         gen_loss = -self._disc(fake).mean()
         return gen_loss, disc_loss.detach()
@@ -199,20 +200,64 @@ class DecoderTrainer(SectionedWandbTrainer):
 class WMTrainer(SectionedWandbTrainer):
     wandb_section = "wm"
 
-    def __init__(self, *args, sigreg_weight: float = 0.1, sigreg_n_samples: int = 1024, **kwargs):
+    def __init__(
+        self,
+        *args,
+        sigreg_weight: float = 0.1,
+        sigreg_n_samples: int = 1024,
+        rollout_steps: int = 0,
+        rollout_weight: float = 1.0,
+        noise_std: float = 0.0,
+        variance_penalty_weight: float = 0.1,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.sigreg_weight = sigreg_weight
         self.sigreg_n_samples = sigreg_n_samples
+        self.rollout_steps = rollout_steps
+        self.rollout_weight = rollout_weight
+        self.noise_std = noise_std
+        self.variance_penalty_weight = variance_penalty_weight
         self.sigreg = lejepa.multivariate.SlicingUnivariateTest(
             univariate_test=lejepa.univariate.EppsPulley(n_points=17), num_slices=1024,
         )
         self._sigreg_device = None
+
+    def _current_rollout_steps(self) -> int:
+        k = self.rollout_steps
+        if k < 2 or self.state.max_steps <= 1:
+            return k
+        progress = self.state.global_step / self.state.max_steps
+        ramp = min(1.0, progress / 0.5)
+        return max(1, round(1 + (k - 1) * ramp))
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad(), self.compute_loss_context_manager():
             loss = self.compute_loss(model, inputs)
         return loss.detach().mean(), None, None
+
+    def _rollout_loss(self, model, states: torch.Tensor, actions: torch.Tensor, k: int) -> torch.Tensor:
+        T = states.size(1)
+        if k < 2 or T <= k + 1:
+            return torch.tensor(0.0, device=states.device)
+
+        s = torch.randint(0, T - k, (1,)).item()
+        history = states[:, :s + 1].detach()
+        preds = []
+        for _ in range(k):
+            inp = history if not preds else torch.cat([history, torch.stack(preds, dim=1)], dim=1)
+            pred = model.predict(inp, actions[:, :inp.size(1)])[:, -1]
+            preds.append(pred)
+
+        rollout_preds = torch.stack(preds, dim=1)
+        rollout_targets = states[:, s + 1:s + 1 + k].detach()
+
+        # Weight later steps more heavily
+        weights = torch.arange(1, k + 1, dtype=torch.float32, device=states.device)
+        weights = weights / weights.sum()
+        per_step = F.mse_loss(rollout_preds.float(), rollout_targets.float(), reduction="none")
+        return (per_step.mean(dim=-1).mean(dim=0) * weights).sum()
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         dtype = next(model.parameters()).dtype
@@ -224,33 +269,56 @@ class WMTrainer(SectionedWandbTrainer):
             self._sigreg_device = frames.device
 
         T = frames.size(1)
+        training = self.model.training
 
         states = model.encode(frames)
-        pred_states = model.predict(states[:, :-1], actions[:, :T - 1])
+
+        pred_inputs = states[:, :-1]
+        if training and self.noise_std > 0:
+            pred_inputs = pred_inputs + torch.randn_like(pred_inputs) * self.noise_std
+
+        pred_states = model.predict(pred_inputs, actions[:, :T - 1])
         target_states = states[:, 1:]
 
         pred_loss = F.mse_loss(pred_states.float(), target_states.float())
+
+        pred_std = pred_states.detach().float().std(dim=-1).mean()
+        target_std = target_states.detach().float().std(dim=-1).mean()
+        variance_penalty = F.relu(target_std - pred_std)
 
         flat_states = states.flatten(0, 1).float()
         n = min(self.sigreg_n_samples, flat_states.size(0))
         perm = torch.randperm(flat_states.size(0), device=flat_states.device)[:n]
         sigreg_loss = self.sigreg(flat_states[perm])
 
-        loss = pred_loss + self.sigreg_weight * sigreg_loss
+        current_k = self._current_rollout_steps() if training else 0
+        rollout_loss = self._rollout_loss(model, states, actions, current_k) if training else torch.tensor(0.0)
+
+        loss = (
+            pred_loss
+            + self.sigreg_weight * sigreg_loss
+            + self.variance_penalty_weight * variance_penalty
+            + self.rollout_weight * rollout_loss
+        )
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
             with torch.no_grad():
                 flat_z = states.flatten(0, 1).float()
-            self.log({
+            log_dict = {
                 "loss_total": scalar(loss),
                 "pred_loss": scalar(pred_loss),
                 "sigreg": scalar(sigreg_loss),
+                "variance_penalty": scalar(variance_penalty),
                 "z_std_mean": scalar(flat_z.std(dim=0).mean()),
                 "z_std_min": scalar(flat_z.std(dim=0).min()),
                 "z_norm_mean": scalar(flat_z.norm(dim=-1).mean()),
-                "pred_std": scalar(pred_states.detach().float().std(dim=-1).mean()),
-                "target_std": scalar(target_states.detach().float().std(dim=-1).mean()),
-            })
+                "pred_std": scalar(pred_std),
+                "target_std": scalar(target_std),
+            }
+            if self.rollout_steps >= 2:
+                log_dict["rollout_loss"] = scalar(rollout_loss)
+                log_dict["rollout_k"] = float(current_k)
+            self.log(log_dict)
 
         if return_outputs:
             return loss, {"pred_states": pred_states.detach(), "target_states": target_states.detach()}
@@ -376,6 +444,10 @@ def train(
     decoder_epochs: int = 5,
     action_policy_epochs: int = 5,
     decoder_noise_std: float = 0.15,
+    rollout_steps: int = 3,
+    rollout_weight: float = 1.0,
+    predictor_noise_std: float = 0.05,
+    variance_penalty_weight: float = 0.1,
 ):
     if mode not in {"all", "wm", "decoder", "action_policy"}:
         raise ValueError("mode must be 'all', 'wm', 'decoder' or 'action_policy'")
@@ -456,7 +528,9 @@ def train(
 
     if mode in {"all", "wm"}:
         trainer = WMTrainer(
-            model=model, args=args, train_dataset=train_dataset, eval_dataset=eval_dataset, sigreg_weight=0.01,
+            model=model, args=args, train_dataset=train_dataset, eval_dataset=eval_dataset,
+            sigreg_weight=0.01, rollout_steps=rollout_steps, rollout_weight=rollout_weight,
+            noise_std=predictor_noise_std, variance_penalty_weight=variance_penalty_weight,
         )
         if last_checkpoint is not None:
             print(f"Resume: {last_checkpoint}", flush=True)
@@ -617,6 +691,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wm-epochs", type=int, default=3)
     parser.add_argument("--decoder-epochs", type=int, default=5)
     parser.add_argument("--action-policy-epochs", type=int, default=5)
+    parser.add_argument("--rollout-steps", type=int, default=3, help="Max rollout depth for WM training (curriculum grows 1→k over first 50%% of training)")
+    parser.add_argument("--rollout-weight", type=float, default=1.0, help="Weight of the rollout loss")
+    parser.add_argument("--predictor-noise-std", type=float, default=0.05, help="Gaussian noise std on predictor input states during WM training")
+    parser.add_argument("--variance-penalty-weight", type=float, default=0.1, help="Weight of the pred_std < target_std penalty")
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -637,4 +715,8 @@ if __name__ == "__main__":
         wm_epochs=cli.wm_epochs,
         decoder_epochs=cli.decoder_epochs,
         action_policy_epochs=cli.action_policy_epochs,
+        rollout_steps=cli.rollout_steps,
+        rollout_weight=cli.rollout_weight,
+        predictor_noise_std=cli.predictor_noise_std,
+        variance_penalty_weight=cli.variance_penalty_weight,
     )

@@ -129,7 +129,8 @@ class DecoderTrainer(SectionedWandbTrainer):
         resume_disc_dir: str | None = None,
         lpips_warmup_steps: int = 200,
         scheduled_sampling: bool = True,
-        roundtrip_weight: float = 0.1,
+        noise_robustness_weight: float = 0.05,
+        noise_robustness_std: float = 0.3,
         pred_cls_ratio: float = 0.2,
         gan_start_step: int = 1000,
         **kwargs,
@@ -140,7 +141,8 @@ class DecoderTrainer(SectionedWandbTrainer):
         self._disc_resume_dir = resume_disc_dir
         self.lpips_warmup_steps = lpips_warmup_steps
         self.scheduled_sampling = scheduled_sampling
-        self.roundtrip_weight = roundtrip_weight
+        self.noise_robustness_weight = noise_robustness_weight
+        self.noise_robustness_std = noise_robustness_std
         self.pred_cls_ratio = pred_cls_ratio
         self.gan_start_step = gan_start_step
         self.lpips_loss = lpips.LPIPS(net="alex").eval()
@@ -205,11 +207,13 @@ class DecoderTrainer(SectionedWandbTrainer):
             lpips_loss = torch.tensor(0.0, device=recon.device)
             loss = l1_loss
 
-        # Round-trip consistency
-        _, recon_tokens = model.encode(recon.unsqueeze(1), return_tokens=True)
-        recon_patches = recon_tokens[:, 0, 1:]
-        cycle_loss = F.mse_loss(recon_patches.float(), patches_prev_flat.detach().float())
-        loss = loss + self.roundtrip_weight * cycle_loss
+        # Noise robustness
+        noise_robustness_loss = torch.tensor(0.0, device=recon.device)
+        if self.model.training:
+            cls_noisy = cls_next_flat + torch.randn_like(cls_next_flat) * self.noise_robustness_std
+            recon_noisy = model.decode(cls_noisy, patches_prev_flat)
+            noise_robustness_loss = F.l1_loss(recon_noisy.float(), targets.float())
+            loss = loss + self.noise_robustness_weight * noise_robustness_loss
 
         gen_loss = None
         disc_loss = None
@@ -223,7 +227,7 @@ class DecoderTrainer(SectionedWandbTrainer):
                 "l1": scalar(l1_loss),
                 "lpips": scalar(lpips_loss),
                 "lpips_active": float(lpips_active),
-                "cycle": scalar(cycle_loss),
+                "noise_robustness": scalar(noise_robustness_loss),
             }
             if gen_loss is not None:
                 log_dict["gan"] = scalar(gen_loss)
@@ -725,7 +729,8 @@ def train(
         resume_disc_dir=decoder_checkpoint,
         lpips_warmup_steps=200,
         scheduled_sampling=True,
-        roundtrip_weight=0.1,
+        noise_robustness_weight=0.05,
+        noise_robustness_std=0.3,
         pred_cls_ratio=0.2,
         gan_start_step=1000,
     )

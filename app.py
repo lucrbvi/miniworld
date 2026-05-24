@@ -61,7 +61,7 @@ def _tensor_to_pil(t: torch.Tensor) -> Image.Image:
 @spaces.GPU
 def initialize(init_image: np.ndarray | None):
     if init_image is None:
-        return None, None, [], 0, "Steps: 0"
+        return None, None, None, [], 0, "Steps: 0"
 
     m = get_model().to(DEVICE)
 
@@ -69,28 +69,33 @@ def initialize(init_image: np.ndarray | None):
     ft = _frame_to_tensor(np.array(pil))
 
     with torch.inference_mode():
-        states = m.encode(ft.unsqueeze(0).unsqueeze(0))
+        states, tokens = m.encode(ft.unsqueeze(0).unsqueeze(0), return_tokens=True)
+        cls = states[:, 0]
+        patches = tokens[:, 0, 1:]
 
-    return pil, states.cpu(), [], 0, "Steps: 0"
+    return pil, cls.cpu(), patches.cpu(), [], 0, "Steps: 0"
 
 @spaces.GPU
-def step(action_name: str, cls_history, actions_list: list, step_count: int):
-    if cls_history is None:
-        return None, None, [], 0, "Steps: 0"
+def step(action_name: str, cls_history, patches_prev, actions_list: list, step_count: int):
+    if cls_history is None or patches_prev is None:
+        return None, None, None, [], 0, "Steps: 0"
 
     m = get_model().to(DEVICE)
     action = ACTIONS[action_name]
     actions_list = actions_list + [action]
 
     cls_history = cls_history.to(device=DEVICE, dtype=torch.float16)
+    patches_prev = patches_prev.to(device=DEVICE, dtype=torch.float16)
     t = cls_history.size(1)
 
     action_tensor = torch.tensor(actions_list[-t:], device=DEVICE, dtype=torch.float16).unsqueeze(0)
 
     with torch.inference_mode():
         pred = m.predict(cls_history, action_tensor)[:, -1]
-        frame = m.decode(pred)[0]
+        frame = m.decode(pred, patches_prev)[0]
+        _, next_tokens = m.encode(frame.unsqueeze(0).unsqueeze(0), return_tokens=True)
 
+    next_patches = next_tokens[:, 0, 1:]
     next_cls = pred.unsqueeze(1)
     if t < MAX_CONTEXT:
         cls_history = torch.cat([cls_history, next_cls], dim=1)
@@ -98,7 +103,7 @@ def step(action_name: str, cls_history, actions_list: list, step_count: int):
         cls_history = torch.cat([cls_history[:, 1:], next_cls], dim=1)
         actions_list = actions_list[-MAX_CONTEXT:]
 
-    return _tensor_to_pil(frame), cls_history.cpu(), actions_list, step_count + 1, f"Steps: {step_count + 1}"
+    return _tensor_to_pil(frame), cls_history.cpu(), next_patches.cpu(), actions_list, step_count + 1, f"Steps: {step_count + 1}"
 
 _JS = """
 () => {
@@ -131,6 +136,7 @@ CSS = """
 
 with gr.Blocks(title="Doom World Model", css=CSS, js=_JS) as demo:
     token_state = gr.State(value=None)
+    patches_state = gr.State(value=None)
     actions_state = gr.State(value=[])
     step_count = gr.State(value=0)
 
@@ -175,11 +181,11 @@ with gr.Blocks(title="Doom World Model", css=CSS, js=_JS) as demo:
     init_btn.click(
         fn=initialize,
         inputs=[init_img],
-        outputs=[frame_out, token_state, actions_state, step_count, steps_out],
+        outputs=[frame_out, token_state, patches_state, actions_state, step_count, steps_out],
     )
 
-    _STEP_INPUTS = [token_state, actions_state, step_count]
-    _STEP_OUTPUTS = [frame_out, token_state, actions_state, step_count, steps_out]
+    _STEP_INPUTS = [token_state, patches_state, actions_state, step_count]
+    _STEP_OUTPUTS = [frame_out, token_state, patches_state, actions_state, step_count, steps_out]
 
     for btn, action_name in [
         (b_fwd, "Forward"),

@@ -111,8 +111,8 @@ class PatchDiscriminator(nn.Module):
             nn.Conv2d(3, 64, 4, 2, 1), nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(64, 128, 4, 2, 1), nn.InstanceNorm2d(128), nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(128, 256, 4, 2, 1), nn.InstanceNorm2d(256), nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(256, 512, 4, 1, 1), nn.InstanceNorm2d(512), nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(512, 1, 4, 1, 1),
+            nn.Conv2d(256, 256, 4, 1, 1), nn.InstanceNorm2d(256), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(256, 1, 4, 1, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -121,11 +121,28 @@ class PatchDiscriminator(nn.Module):
 class DecoderTrainer(SectionedWandbTrainer):
     wandb_section = "decoder"
 
-    def __init__(self, *args, lpips_weight: float = 0.2, noise_std: float = 0.15, resume_disc_dir: str | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        lpips_weight: float = 0.2,
+        noise_std: float = 0.15,
+        resume_disc_dir: str | None = None,
+        lpips_warmup_steps: int = 200,
+        scheduled_sampling: bool = True,
+        roundtrip_weight: float = 0.1,
+        pred_cls_ratio: float = 0.2,
+        gan_start_step: int = 1000,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.lpips_weight = lpips_weight
         self.noise_std = noise_std
         self._disc_resume_dir = resume_disc_dir
+        self.lpips_warmup_steps = lpips_warmup_steps
+        self.scheduled_sampling = scheduled_sampling
+        self.roundtrip_weight = roundtrip_weight
+        self.pred_cls_ratio = pred_cls_ratio
+        self.gan_start_step = gan_start_step
         self.lpips_loss = lpips.LPIPS(net="alex").eval()
         for param in self.lpips_loss.parameters():
             param.requires_grad = False
@@ -139,6 +156,7 @@ class DecoderTrainer(SectionedWandbTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         dtype = next(model.parameters()).dtype
         frames = inputs["frames"].to(dtype=dtype) / 255.0
+        actions = inputs["actions"].to(dtype=dtype)
         B, T, C, H, W = frames.shape
 
         if self.model.training:
@@ -159,23 +177,54 @@ class DecoderTrainer(SectionedWandbTrainer):
             cls_next = cls_next + torch.randn_like(cls_next) * self.noise_std
             patches_prev = patches_prev + torch.randn_like(patches_prev) * self.noise_std
 
+        if self.model.training and torch.rand(1).item() < self.pred_cls_ratio:
+            with torch.no_grad():
+                pred_cls_next = model.predict(states[:, :-1], actions[:, : T - 1])
+            cls_next = pred_cls_next.detach()
+
         cls_next_flat = cls_next.flatten(0, 1)
         patches_prev_flat = patches_prev.flatten(0, 1)
         targets = frames[:, 1:].flatten(0, 1)
 
+        if self.model.training and self.scheduled_sampling and torch.rand(1).item() < self._scheduled_sampling_prob():
+            with torch.no_grad():
+                fake_recon = model.decode(cls_next_flat, patches_prev_flat)
+                _, fake_tokens = model.encode(fake_recon.unsqueeze(1), return_tokens=True)
+                patches_prev_flat = fake_tokens[:, 0, 1:].detach()
+
         recon = model.decode(cls_next_flat, patches_prev_flat)
 
         l1_loss = F.l1_loss(recon.float(), targets.float())
-        lpips_loss = self.lpips_loss(recon.float() * 2 - 1, targets.float() * 2 - 1).mean()
-        loss = l1_loss + self.lpips_weight * lpips_loss
+
+        # LPIPS warm-up
+        lpips_active = self.state.global_step >= self.lpips_warmup_steps
+        if lpips_active:
+            lpips_loss = self.lpips_loss(recon.float() * 2 - 1, targets.float() * 2 - 1).mean()
+            loss = l1_loss + self.lpips_weight * lpips_loss
+        else:
+            lpips_loss = torch.tensor(0.0, device=recon.device)
+            loss = l1_loss
+
+        # Round-trip consistency
+        _, recon_tokens = model.encode(recon.unsqueeze(1), return_tokens=True)
+        recon_patches = recon_tokens[:, 0, 1:]
+        cycle_loss = F.mse_loss(recon_patches.float(), patches_prev_flat.detach().float())
+        loss = loss + self.roundtrip_weight * cycle_loss
 
         gen_loss = None
-        if self.model.training and self.noise_std > 0:
+        disc_loss = None
+        if self.model.decoder.training and self.noise_std > 0 and self.state.global_step >= self.gan_start_step:
             gen_loss, disc_loss = self._gan_loss(recon.float(), targets.float())
             loss = loss + 0.1 * gen_loss
 
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
-            log_dict = {"loss": scalar(loss), "l1": scalar(l1_loss), "lpips": scalar(lpips_loss)}
+            log_dict = {
+                "loss": scalar(loss),
+                "l1": scalar(l1_loss),
+                "lpips": scalar(lpips_loss),
+                "lpips_active": float(lpips_active),
+                "cycle": scalar(cycle_loss),
+            }
             if gen_loss is not None:
                 log_dict["gan"] = scalar(gen_loss)
                 log_dict["discriminator_loss"] = scalar(disc_loss)
@@ -185,8 +234,14 @@ class DecoderTrainer(SectionedWandbTrainer):
             return loss, {"recon": recon.detach()}
         return loss
 
-    def _save_checkpoint(self, model, trial, metrics=None):
-        super()._save_checkpoint(model, trial, metrics=metrics)
+    def _scheduled_sampling_prob(self) -> float:
+        if self.state.max_steps <= 1:
+            return 0.0
+        p = self.state.global_step / max(1, self.state.max_steps)
+        return max(0.0, (p - 0.3) / 0.7) * 0.5
+
+    def _save_checkpoint(self, model, trial, metrics=None, run_dir=None):
+        super()._save_checkpoint(model, trial, metrics=metrics, run_dir=run_dir)
         if hasattr(self, "_disc"):
             ckpt = os.path.join(self.args.output_dir, f"checkpoint-{self.state.global_step}")
             torch.save(self._disc.state_dict(), os.path.join(ckpt, "discriminator.pt"))
@@ -381,7 +436,7 @@ def compute_grouped_loss(logits: torch.Tensor, actions: torch.Tensor) -> torch.T
     loss_move = F.cross_entropy(logits[..., 0:3].flatten(0, -2), move_t.flatten())
     loss_strafe = F.cross_entropy(logits[..., 3:6].flatten(0, -2), strafe_t.flatten())
     loss_turn = F.cross_entropy(logits[..., 6:9].flatten(0, -2), turn_t.flatten())
-    loss_bin = F.binary_cross_entropy_with_logits(logits[..., 9:12].flatten(0, -2), bin_t.flatten())
+    loss_bin = F.binary_cross_entropy_with_logits(logits[..., 9:12].flatten(0, -2), bin_t.flatten(0, -2))
     return loss_move + loss_strafe + loss_turn + loss_bin
 
 class ActionPolicyTrainer(SectionedWandbTrainer):
@@ -408,7 +463,8 @@ class ActionPolicyTrainer(SectionedWandbTrainer):
         with torch.no_grad():
             states = self.wm_model.encode(frames)
 
-        if self._teacher_prob() < 1.0 and torch.rand(1).item() > self._teacher_prob():
+        teacher_prob = self._teacher_prob()
+        if teacher_prob < 1.0 and torch.rand(1).item() > teacher_prob:
             with torch.no_grad():
                 logits_teacher = model(states, past_actions=actions)
                 pred_binary = ActionPolicy.logits_to_binary(logits_teacher.detach()).float()
@@ -660,7 +716,19 @@ def train(
     decoder_checkpoint = resolve_checkpoint(resume_from, decoder_args.output_dir)
     if decoder_checkpoint is not None:
         print(f"Resume decoder: {decoder_checkpoint}", flush=True)
-    trainer = DecoderTrainer(model=model, args=decoder_args, train_dataset=train_dataset, eval_dataset=eval_dataset, noise_std=decoder_noise_std, resume_disc_dir=decoder_checkpoint)
+    trainer = DecoderTrainer(
+        model=model,
+        args=decoder_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        noise_std=decoder_noise_std,
+        resume_disc_dir=decoder_checkpoint,
+        lpips_warmup_steps=200,
+        scheduled_sampling=True,
+        roundtrip_weight=0.1,
+        pred_cls_ratio=0.2,
+        gan_start_step=1000,
+    )
     start_wandb_run("decoder-probe", config=config.to_dict())
     trainer.train(resume_from_checkpoint=decoder_checkpoint)
     if hasattr(trainer.model.decoder, "_orig_mod"):
@@ -694,12 +762,20 @@ def train(
         optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
         torch_compile=True,
     )
+    policy = ActionPolicy(
+        dim=model.config.dim,
+        n_heads=model.config.n_heads,
+        ffn_mult=model.config.ffn_mult,
+        max_seq_len=max(context_len, model.config.max_seq_len),
+    )
     ap_trainer = ActionPolicyTrainer(
-        wm_model=model, model=ActionPolicy(model.config.dim), args=ap_args,
+        wm_model=model, model=policy, args=ap_args,
         train_dataset=train_dataset, eval_dataset=eval_dataset,
     )
     start_wandb_run("action-policy", config=config.to_dict())
     ap_trainer.train()
+    if hasattr(ap_trainer.model, "_orig_mod"):
+        ap_trainer.model = ap_trainer.model._orig_mod
     ap_trainer.save_model(ap_args.output_dir)
     finish_wandb()
 

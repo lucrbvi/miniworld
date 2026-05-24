@@ -7,7 +7,6 @@ import lejepa
 import lpips
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from datasets import Dataset as HFDataset, load_dataset
@@ -33,7 +32,7 @@ def find_last_checkpoint(path: str) -> str | None:
     return get_last_checkpoint(path) if os.path.isdir(path) else None
 
 class WMDataset(torch.utils.data.Dataset):
-    def __init__(self, hf_dataset: HFDataset, context_len: int, sequence_stride: int = 1, name: str = "dataset"):
+    def __init__(self, hf_dataset: HFDataset, context_len: int, sequence_stride: int = 1):
         self.context_len = context_len
         self.window_len = context_len
         self.sequence_stride = sequence_stride
@@ -104,20 +103,6 @@ class SectionedWandbTrainer(Trainer):
 def scalar(value: torch.Tensor) -> float:
     return value.detach().float().cpu().item()
 
-class PatchDiscriminator(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 64, 4, 2, 1), nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 128, 4, 2, 1), nn.InstanceNorm2d(128), nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(128, 256, 4, 2, 1), nn.InstanceNorm2d(256), nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(256, 256, 4, 1, 1), nn.InstanceNorm2d(256), nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(256, 1, 4, 1, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
 class DecoderTrainer(SectionedWandbTrainer):
     wandb_section = "decoder"
 
@@ -126,25 +111,17 @@ class DecoderTrainer(SectionedWandbTrainer):
         *args,
         lpips_weight: float = 0.2,
         noise_std: float = 0.15,
-        resume_disc_dir: str | None = None,
         lpips_warmup_steps: int = 200,
-        scheduled_sampling: bool = True,
         noise_robustness_weight: float = 0.05,
         noise_robustness_std: float = 0.3,
-        pred_cls_ratio: float = 0.2,
-        gan_start_step: int = 1000,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.lpips_weight = lpips_weight
         self.noise_std = noise_std
-        self._disc_resume_dir = resume_disc_dir
         self.lpips_warmup_steps = lpips_warmup_steps
-        self.scheduled_sampling = scheduled_sampling
         self.noise_robustness_weight = noise_robustness_weight
         self.noise_robustness_std = noise_robustness_std
-        self.pred_cls_ratio = pred_cls_ratio
-        self.gan_start_step = gan_start_step
         self.lpips_loss = lpips.LPIPS(net="alex").eval()
         for param in self.lpips_loss.parameters():
             param.requires_grad = False
@@ -175,11 +152,11 @@ class DecoderTrainer(SectionedWandbTrainer):
         patches_prev = tokens[:, :-1, 1:].detach()
         cls_next = states[:, 1:]
 
-        if self.model.training and self.noise_std > 0:
+        if self.model.training:
             cls_next = cls_next + torch.randn_like(cls_next) * self.noise_std
             patches_prev = patches_prev + torch.randn_like(patches_prev) * self.noise_std
 
-        if self.model.training and torch.rand(1).item() < self.pred_cls_ratio:
+        if self.model.training and torch.rand(1).item() < 0.5:
             with torch.no_grad():
                 pred_cls_next = model.predict(states[:, :-1], actions[:, : T - 1])
             cls_next = pred_cls_next.detach()
@@ -188,7 +165,9 @@ class DecoderTrainer(SectionedWandbTrainer):
         patches_prev_flat = patches_prev.flatten(0, 1)
         targets = frames[:, 1:].flatten(0, 1)
 
-        if self.model.training and self.scheduled_sampling and torch.rand(1).item() < self._scheduled_sampling_prob():
+        ss_active = False
+        if self.model.training and torch.rand(1).item() < self._scheduled_sampling_prob():
+            ss_active = True
             with torch.no_grad():
                 fake_recon = model.decode(cls_next_flat, patches_prev_flat)
                 _, fake_tokens = model.encode(fake_recon.unsqueeze(1), return_tokens=True)
@@ -211,28 +190,21 @@ class DecoderTrainer(SectionedWandbTrainer):
         noise_robustness_loss = torch.tensor(0.0, device=recon.device)
         if self.model.training:
             cls_noisy = cls_next_flat + torch.randn_like(cls_next_flat) * self.noise_robustness_std
-            recon_noisy = model.decode(cls_noisy, patches_prev_flat)
+            patches_noisy = patches_prev_flat + torch.randn_like(patches_prev_flat) * self.noise_robustness_std
+            recon_noisy = model.decode(cls_noisy, patches_noisy)
             noise_robustness_loss = F.l1_loss(recon_noisy.float(), targets.float())
             loss = loss + self.noise_robustness_weight * noise_robustness_loss
 
-        gen_loss = None
-        disc_loss = None
-        if self.model.decoder.training and self.noise_std > 0 and self.state.global_step >= self.gan_start_step:
-            gen_loss, disc_loss = self._gan_loss(recon.float(), targets.float())
-            loss = loss + 0.1 * gen_loss
-
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
-            log_dict = {
+            self.log({
                 "loss": scalar(loss),
                 "l1": scalar(l1_loss),
                 "lpips": scalar(lpips_loss),
                 "lpips_active": float(lpips_active),
                 "noise_robustness": scalar(noise_robustness_loss),
-            }
-            if gen_loss is not None:
-                log_dict["gan"] = scalar(gen_loss)
-                log_dict["discriminator_loss"] = scalar(disc_loss)
-            self.log(log_dict)
+                "ss_active": float(ss_active),
+                "ss_prob": self._scheduled_sampling_prob(),
+            })
 
         if return_outputs:
             return loss, {"recon": recon.detach()}
@@ -243,44 +215,6 @@ class DecoderTrainer(SectionedWandbTrainer):
             return 0.0
         p = self.state.global_step / max(1, self.state.max_steps)
         return max(0.0, (p - 0.3) / 0.7) * 0.5
-
-    def _save_checkpoint(self, model, trial, metrics=None, run_dir=None):
-        super()._save_checkpoint(model, trial, metrics=metrics, run_dir=run_dir)
-        if hasattr(self, "_disc"):
-            ckpt = os.path.join(self.args.output_dir, f"checkpoint-{self.state.global_step}")
-            torch.save(self._disc.state_dict(), os.path.join(ckpt, "discriminator.pt"))
-
-    def _gan_loss(self, fake: torch.Tensor, real: torch.Tensor, r1_gamma: float = 10.0, r1_batch: int = 40) -> tuple[torch.Tensor, torch.Tensor]:
-        if not hasattr(self, "_disc"):
-            self._disc = PatchDiscriminator().to(fake.device)
-            self._disc_opt = torch.optim.Adam(self._disc.parameters(), lr=1e-4, betas=(0.5, 0.9))
-            if self._disc_resume_dir is not None:
-                disc_path = os.path.join(self._disc_resume_dir, "discriminator.pt")
-                if os.path.exists(disc_path):
-                    self._disc.load_state_dict(torch.load(disc_path, map_location=fake.device, weights_only=True))
-
-        fake_det = fake.detach()
-        real_pred = self._disc(real)
-        fake_pred_det = self._disc(fake_det)
-        disc_loss = F.relu(1.0 - real_pred).mean() + F.relu(1.0 + fake_pred_det).mean()
-
-        r1_penalty = torch.tensor(0.0, device=fake.device)
-        if r1_gamma > 0:
-            n = min(real.size(0), r1_batch)
-            idx = torch.randperm(real.size(0), device=real.device)[:n]
-            real_sub = real[idx].detach().requires_grad_(True)
-            real_pred_sub = self._disc(real_sub)
-            grad_real, = torch.autograd.grad(
-                outputs=real_pred_sub.sum(), inputs=real_sub, create_graph=True, only_inputs=True,
-            )
-            r1_penalty = 0.5 * r1_gamma * grad_real.pow(2).mean()
-
-        self._disc_opt.zero_grad()
-        (disc_loss + r1_penalty).backward()
-        self._disc_opt.step()
-
-        gen_loss = -self._disc(fake).mean()
-        return gen_loss, disc_loss.detach()
 
 class WMTrainer(SectionedWandbTrainer):
     wandb_section = "wm"
@@ -425,9 +359,6 @@ def resolve_checkpoint(resume_from: str | None, output_dir: str) -> str | None:
         raise FileNotFoundError(f"Checkpoint not found: {resume_from}")
     return resume_from
 
-ACTION_NAMES = ["FWD", "BCK", "LEFT", "RIGHT", "TURN_L", "TURN_R", "ATTACK", "USE", "SPEED"]
-
-
 def binary_to_grouped(actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     move_target = torch.where(actions[..., 0] > 0.5, 0, torch.where(actions[..., 1] > 0.5, 1, 2))
     strafe_target = torch.where(actions[..., 2] > 0.5, 0, torch.where(actions[..., 3] > 0.5, 1, 2))
@@ -548,8 +479,8 @@ def train(
     print(f"Device: {device} | Dataset: {config.to_dict()['height']}x{config.to_dict()['width']} | dim={config.dim} | blocks={config.n_blocks} | heads={config.n_heads}", flush=True)
     ds = load_dataset("lucrbrtv/doom-e1-internet-gameplay", split="train")
     split = ds.train_test_split(test_size=0.1, shuffle=False)
-    train_dataset = WMDataset(split["train"], context_len=context_len, sequence_stride=sequence_stride, name="train")
-    eval_dataset = WMDataset(split["test"], context_len=context_len, sequence_stride=sequence_stride, name="eval")
+    train_dataset = WMDataset(split["train"], context_len=context_len, sequence_stride=sequence_stride)
+    eval_dataset = WMDataset(split["test"], context_len=context_len, sequence_stride=sequence_stride)
     eval_dataset = torch.utils.data.Subset(eval_dataset, range(min(max_eval_sequences, len(eval_dataset))))
     print(f"Data: {len(ds):,} frames | {len(train_dataset):,} train seqs | {len(eval_dataset):,} eval seqs | context={context_len} | stride={sequence_stride}", flush=True)
     setup_wandb()
@@ -726,13 +657,9 @@ def train(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         noise_std=decoder_noise_std,
-        resume_disc_dir=decoder_checkpoint,
         lpips_warmup_steps=200,
-        scheduled_sampling=True,
         noise_robustness_weight=0.05,
         noise_robustness_std=0.3,
-        pred_cls_ratio=0.2,
-        gan_start_step=1000,
     )
     start_wandb_run("decoder-probe", config=config.to_dict())
     trainer.train(resume_from_checkpoint=decoder_checkpoint)

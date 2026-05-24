@@ -112,16 +112,12 @@ class DecoderTrainer(SectionedWandbTrainer):
         lpips_weight: float = 0.2,
         noise_std: float = 0.15,
         lpips_warmup_steps: int = 200,
-        noise_robustness_weight: float = 0.05,
-        noise_robustness_std: float = 0.3,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.lpips_weight = lpips_weight
         self.noise_std = noise_std
         self.lpips_warmup_steps = lpips_warmup_steps
-        self.noise_robustness_weight = noise_robustness_weight
-        self.noise_robustness_std = noise_robustness_std
         self.lpips_loss = lpips.LPIPS(net="alex").eval()
         for param in self.lpips_loss.parameters():
             param.requires_grad = False
@@ -150,16 +146,16 @@ class DecoderTrainer(SectionedWandbTrainer):
             states, tokens = model.encode(frames, return_tokens=True)
 
         patches_prev = tokens[:, :-1, 1:].detach()
-        cls_next = states[:, 1:]
+
+        if self.model.training and torch.rand(1).item() < 0.5:
+            with torch.no_grad():
+                cls_next = model.predict(states[:, :-1], actions[:, : T - 1]).detach()
+        else:
+            cls_next = states[:, 1:]
 
         if self.model.training:
             cls_next = cls_next + torch.randn_like(cls_next) * self.noise_std
             patches_prev = patches_prev + torch.randn_like(patches_prev) * self.noise_std
-
-        if self.model.training and torch.rand(1).item() < 0.5:
-            with torch.no_grad():
-                pred_cls_next = model.predict(states[:, :-1], actions[:, : T - 1])
-            cls_next = pred_cls_next.detach()
 
         cls_next_flat = cls_next.flatten(0, 1)
         patches_prev_flat = patches_prev.flatten(0, 1)
@@ -186,22 +182,12 @@ class DecoderTrainer(SectionedWandbTrainer):
             lpips_loss = torch.tensor(0.0, device=recon.device)
             loss = l1_loss
 
-        # Noise robustness
-        noise_robustness_loss = torch.tensor(0.0, device=recon.device)
-        if self.model.training:
-            cls_noisy = cls_next_flat + torch.randn_like(cls_next_flat) * self.noise_robustness_std
-            patches_noisy = patches_prev_flat + torch.randn_like(patches_prev_flat) * self.noise_robustness_std
-            recon_noisy = model.decode(cls_noisy, patches_noisy)
-            noise_robustness_loss = F.l1_loss(recon_noisy.float(), targets.float())
-            loss = loss + self.noise_robustness_weight * noise_robustness_loss
-
         if self.state.global_step == 0 or self.state.global_step % self.args.logging_steps == 0:
             self.log({
                 "loss": scalar(loss),
                 "l1": scalar(l1_loss),
                 "lpips": scalar(lpips_loss),
                 "lpips_active": float(lpips_active),
-                "noise_robustness": scalar(noise_robustness_loss),
                 "ss_active": float(ss_active),
                 "ss_prob": self._scheduled_sampling_prob(),
             })
@@ -646,7 +632,7 @@ def train(
         report_to=[],
         run_name="decoder-probe",
         optim="adamw_torch_fused" if device == "cuda" else "adamw_torch",
-        torch_compile=False,
+        torch_compile=True,
     )
     decoder_checkpoint = resolve_checkpoint(resume_from, decoder_args.output_dir)
     if decoder_checkpoint is not None:
@@ -658,8 +644,6 @@ def train(
         eval_dataset=eval_dataset,
         noise_std=decoder_noise_std,
         lpips_warmup_steps=200,
-        noise_robustness_weight=0.05,
-        noise_robustness_std=0.3,
     )
     start_wandb_run("decoder-probe", config=config.to_dict())
     trainer.train(resume_from_checkpoint=decoder_checkpoint)

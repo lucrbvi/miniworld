@@ -282,7 +282,7 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Play with a trained DOOM world model through a raylib UI.")
-    parser.add_argument("--model", default="./checkpoints", help="Checkpoint directory or .safetensors file")
+    parser.add_argument("--model", default="./checkpoints/world-model", help="Checkpoint directory or .safetensors file")
     parser.add_argument("--frame", help="Initial DOOM frame image")
     parser.add_argument("--context-len", type=int, default=10)
     parser.add_argument("--fps", type=float, default=1.0, help="World-model prediction rate")

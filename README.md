@@ -8,6 +8,16 @@ A small *Latent World Model* of [DOOM (1993)](https://en.wikipedia.org/wiki/Doom
 uv sync
 ```
 
+## Download pretrained weights
+
+```sh
+uv run download_weights.py
+```
+
+This pulls the world model (and action policy, if available) from the
+[Hugging Face Hub](https://huggingface.co/lucrbrtv/doom-world-model) into
+`./checkpoints/world-model/` and `./checkpoints/action-policy/`.
+
 ## Train
 
 ```sh
@@ -24,9 +34,10 @@ The `decoder` and `action_policy` modes need a trained world model to start from
 ## Play inside the world model
 
 Drive the world model with your keyboard and play a pseudo-DOOM game.
+First download the weights (see above), then run:
 
 ```sh
-uv run dream.py --model ./checkpoints
+uv run dream.py
 ```
 
 ## Let the policy play
@@ -34,8 +45,10 @@ uv run dream.py --model ./checkpoints
 The learned action policy plays in the real DOOM engine while you watch.
 
 ```sh
-uv run autoplay.py --model ./checkpoints/world-model --action-policy ./checkpoints/action-policy
+uv run autoplay.py
 ```
+
+This uses `./checkpoints/world-model` and `./checkpoints/action-policy` by default.
 
 Pass `--wad path/to/doom.wad` to play the real game (for example `DOOM.WAD`). Without it, VizDoom falls back to its bundled FreeDoom resources, which work but look slightly off and have different level names. You can also add `--record out.mp4` to save a video, or `--headless` to skip the window.
 

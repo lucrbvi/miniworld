@@ -138,7 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--map", default="E1M1")
     parser.add_argument("--skill", type=int, default=1)
     parser.add_argument("--scale", type=int, default=2)
-    parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sigmoid/softmax (lower = more deterministic)")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Temperature for sigmoid/softmax (lower = more deterministic)")
     parser.add_argument("--epsilon", type=float, default=0.05, help="Random action probability to break loops")
     parser.add_argument("--frame-skip", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=5000)
